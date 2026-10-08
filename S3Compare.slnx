@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="S3Compare.App/S3Compare.App.csproj" />
+  <Project Path="S3Compare.Tests/S3Compare.Tests.csproj" />
+</Solution>
