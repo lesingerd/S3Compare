@@ -126,17 +126,17 @@ public class EngineBehaviorTests
         var stats = await engine.RunAsync();
 
         Assert.Equal(5, stats.ObjectsCompared);
-        Assert.Equal(2, stats.MatchedCount);           // a-good (bytes equal) and e-after (ETags equal)
+        Assert.Equal(3, stats.MatchedCount);           // a-good, d-single (bytes equal) and e-after (ETags equal)
         Assert.Equal(1, stats.ContentCheckErrorCount);
-        Assert.Equal(2, stats.ContentMismatchCount);   // c-diff (bytes) and d-single (ETag proves it)
-        Assert.Equal(3, stats.TotalDifferences);
+        Assert.Equal(1, stats.ContentMismatchCount);   // c-diff (bytes)
+        Assert.Equal(2, stats.TotalDifferences);
 
         var error = diffs.Single(d => d.Type == DifferenceType.ContentCheckError);
         Assert.Equal("b-bad", error.Key);
         Assert.Contains("InvalidObjectState", error.Details);
 
-        // Single-part objects with different ETags are never downloaded
-        Assert.DoesNotContain("d-single", compared);
+        // Differing single-part ETags are still downloaded (SSE-KMS ETags are not MD5); equal ETags are not
+        Assert.Contains("d-single", compared);
         Assert.DoesNotContain("e-after", compared);
     }
 

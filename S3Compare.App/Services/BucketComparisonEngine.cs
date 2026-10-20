@@ -637,19 +637,8 @@ public class BucketComparisonEngine
         }
 
         // Full Data mode
-        bool singlePartBoth = !itemA.ETag.Contains('-') && !itemB.ETag.Contains('-');
-        if (singlePartBoth)
-        {
-            // Single-part ETags are content hashes: different hashes with equal sizes already prove different content,
-            // so no download (and no egress) is needed. (Not valid for SSE-KMS/SSE-C objects, whose ETags are not MD5.)
-            var diff = BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentMismatch,
-                $"Content mismatch: single-part ETags differ (A: {itemA.ETag}, B: {itemB.ETag}) with identical size ({itemA.FormattedSize}).");
-            await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
-            _stats.ContentMismatchCount++;
-            _stats.TotalDifferences++;
-            return;
-        }
-
+        // Always download: single-part ETags are not MD5 content hashes for SSE-KMS/SSE-C objects,
+        // so differing ETags alone do not prove the content differs.
         bool contentMatches;
         try
         {
