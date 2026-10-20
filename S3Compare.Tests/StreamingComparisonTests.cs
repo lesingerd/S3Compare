@@ -9,10 +9,13 @@ public class MockS3ObjectStream : IS3ObjectStream
     private long _totalObjectsRead;
     private long _totalBytesRead;
     private bool _hasMore = true;
+    private readonly Action<long>? _onRead;
 
-    public MockS3ObjectStream(IEnumerable<S3ObjectSummary> items)
+    public MockS3ObjectStream(IEnumerable<S3ObjectSummary> items, Action<long>? onRead = null)
     {
-        _enumerator = items.OrderBy(x => x.Key, StringComparer.Ordinal).GetEnumerator();
+        // Sorted the way S3 lists keys: UTF-8 byte order
+        _enumerator = items.OrderBy(x => x.Key, Utf8KeyComparer.Instance).GetEnumerator();
+        _onRead = onRead;
     }
 
     public S3ObjectSummary? Current => _enumerator.Current;
@@ -26,6 +29,7 @@ public class MockS3ObjectStream : IS3ObjectStream
         {
             _totalObjectsRead++;
             _totalBytesRead += _enumerator.Current.Size;
+            _onRead?.Invoke(_totalObjectsRead);
             return Task.FromResult(true);
         }
         _hasMore = false;
@@ -332,42 +336,58 @@ public class StreamingComparisonTests
     }
 
     [Fact]
-    public async Task Compare_CancellationMidStream_ThrowsOperationCanceledException()
+    public async Task Compare_CancellationMidStream_StopsPromptlyWithPartialResults()
     {
+        // Bucket B is empty, so every item processed from A yields exactly one difference
         var items = Enumerable.Range(0, 1000).Select(i => new S3ObjectSummary { Key = $"k_{i:D5}", Size = 10, ETag = "e" }).ToList();
-        var streamA = new MockS3ObjectStream(items);
-        var streamB = new MockS3ObjectStream(items);
-
         using var cts = new CancellationTokenSource();
-        cts.Cancel(); // Pre-canceled or canceled token
 
-        var engine = new BucketComparisonEngine(streamA, streamB, ComparisonMode.ListingOnly);
+        // The stream cancels the scan from inside the engine's read loop after 10 items
+        var streamA = new MockS3ObjectStream(items, read => { if (read == 10) cts.Cancel(); });
+        var streamB = new MockS3ObjectStream(new List<S3ObjectSummary>());
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-        {
-            await engine.RunAsync(cts.Token);
-        });
+        int diffCount = 0;
+        var engine = new BucketComparisonEngine(streamA, streamB, ComparisonMode.ListingOnly, detectSequenceGaps: false);
+        engine.DifferenceFound += _ => diffCount++;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => engine.RunAsync(cts.Token));
+
+        Assert.InRange(diffCount, 1, 20);
     }
 
     [Fact]
-    public async Task Compare_PauseAndResume_ContinuesToCompletion()
+    public async Task Compare_PauseMidStream_HaltsProgressUntilResumed()
     {
-        var itemsA = Enumerable.Range(0, 100).Select(i => new S3ObjectSummary { Key = $"file_{i:D3}.dat", Size = 50, ETag = "e" }).ToList();
-        var itemsB = Enumerable.Range(0, 100).Select(i => new S3ObjectSummary { Key = $"file_{i:D3}.dat", Size = 50, ETag = "e" }).ToList();
+        var items = Enumerable.Range(0, 200).Select(i => new S3ObjectSummary { Key = $"k_{i:D5}", Size = 10, ETag = "e" }).ToList();
 
-        var streamA = new MockS3ObjectStream(itemsA);
-        var streamB = new MockS3ObjectStream(itemsB);
+        BucketComparisonEngine? engine = null;
+        // The stream pauses the scan from inside the engine's read loop after 50 items
+        var streamA = new MockS3ObjectStream(items, read => { if (read == 50) engine!.Pause(); });
+        var streamB = new MockS3ObjectStream(new List<S3ObjectSummary>());
 
-        var engine = new BucketComparisonEngine(streamA, streamB, ComparisonMode.ListingOnly);
-        
-        engine.Pause();
+        int diffCount = 0;
+        engine = new BucketComparisonEngine(streamA, streamB, ComparisonMode.ListingOnly, detectSequenceGaps: false);
+        engine.DifferenceFound += _ => Interlocked.Increment(ref diffCount);
+
+        var runTask = Task.Run(() => engine.RunAsync());
+
+        await Task.Delay(600);
+        Assert.False(runTask.IsCompleted);
         Assert.True(engine.IsPaused);
-        engine.Resume();
-        Assert.False(engine.IsPaused);
+        int pausedCount = Volatile.Read(ref diffCount);
+        Assert.InRange(pausedCount, 49, 51);
 
-        var stats = await engine.RunAsync();
-        Assert.Equal(100, stats.ObjectsCompared);
-        Assert.Equal(100, stats.MatchedCount);
+        await Task.Delay(200);
+        Assert.Equal(pausedCount, Volatile.Read(ref diffCount));
+
+        engine.Resume();
+        var stats = await runTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(engine.IsPaused);
+        Assert.Equal(200, stats.ObjectsCompared);
+        Assert.Equal(200, stats.MissingInBucketBCount);
+        // The ~800ms spent paused must not count towards elapsed time
+        Assert.True(stats.ElapsedTime < TimeSpan.FromMilliseconds(700), $"Elapsed {stats.ElapsedTime} includes paused time");
     }
 
     [Fact]
@@ -443,43 +463,61 @@ public class StreamingComparisonTests
     [Fact]
     public async Task CheckpointManager_SaveLoadDiscard_RoundTrip()
     {
-        var checkpoint = new ScanCheckpoint
+        var tempDir = Path.Combine(Path.GetTempPath(), "S3CompareTests_" + Guid.NewGuid().ToString("N"));
+        try
         {
-            EndpointA = "https://s3.wasabisys.com",
-            BucketNameA = "source-bucket",
-            EndpointB = "https://s3.us-east-1.wasabisys.com",
-            BucketNameB = "target-bucket",
-            LastEvaluatedKey = "folder/file_00500.dat",
-            Mode = ComparisonMode.ListingOnly,
-            ObjectsCompared = 500,
-            TotalDifferences = 3
-        };
+            var checkpoint = new ScanCheckpoint
+            {
+                EndpointA = "https://s3.wasabisys.com",
+                BucketNameA = "source-bucket",
+                PrefixA = "in/",
+                EndpointB = "https://s3.us-east-1.wasabisys.com",
+                BucketNameB = "target-bucket",
+                PrefixB = "out/",
+                LastEvaluatedKey = "folder/file_00500.dat",
+                Mode = ComparisonMode.ListingOnly,
+                ObjectsCompared = 500,
+                TotalDifferences = 3
+            };
 
-        await CheckpointManager.SaveCheckpointAsync(checkpoint);
+            await CheckpointManager.SaveCheckpointAsync(checkpoint, tempDir);
+            // Saving again must atomically replace the existing file
+            checkpoint.ObjectsCompared = 600;
+            await CheckpointManager.SaveCheckpointAsync(checkpoint, tempDir);
 
-        var loaded = await CheckpointManager.FindCheckpointAsync(
-            "source-bucket",
-            "https://s3.wasabisys.com",
-            "",
-            "target-bucket",
-            "https://s3.us-east-1.wasabisys.com",
-            "");
+            var loaded = await CheckpointManager.FindCheckpointAsync(
+                "source-bucket", "https://s3.wasabisys.com", "in/",
+                "target-bucket", "https://s3.us-east-1.wasabisys.com", "out/",
+                ComparisonMode.ListingOnly, tempDir);
 
-        Assert.NotNull(loaded);
-        Assert.Equal("folder/file_00500.dat", loaded.LastEvaluatedKey);
-        Assert.Equal(500, loaded.ObjectsCompared);
+            Assert.NotNull(loaded);
+            Assert.Equal("folder/file_00500.dat", loaded.LastEvaluatedKey);
+            Assert.Equal(600, loaded.ObjectsCompared);
+            Assert.Empty(Directory.GetFiles(CheckpointManager.GetCheckpointDirectory(tempDir), "*.tmp"));
 
-        CheckpointManager.DeleteCheckpoint(loaded);
+            // A checkpoint from a different mode or different prefixes is a different session
+            Assert.Null(await CheckpointManager.FindCheckpointAsync(
+                "source-bucket", "https://s3.wasabisys.com", "in/",
+                "target-bucket", "https://s3.us-east-1.wasabisys.com", "out/",
+                ComparisonMode.FullData, tempDir));
+            Assert.Null(await CheckpointManager.FindCheckpointAsync(
+                "source-bucket", "https://s3.wasabisys.com", "other/",
+                "target-bucket", "https://s3.us-east-1.wasabisys.com", "out/",
+                ComparisonMode.ListingOnly, tempDir));
 
-        var afterDiscard = await CheckpointManager.FindCheckpointAsync(
-            "source-bucket",
-            "https://s3.wasabisys.com",
-            "",
-            "target-bucket",
-            "https://s3.us-east-1.wasabisys.com",
-            "");
+            CheckpointManager.DeleteCheckpoint(loaded, tempDir);
 
-        Assert.Null(afterDiscard);
+            var afterDiscard = await CheckpointManager.FindCheckpointAsync(
+                "source-bucket", "https://s3.wasabisys.com", "in/",
+                "target-bucket", "https://s3.us-east-1.wasabisys.com", "out/",
+                ComparisonMode.ListingOnly, tempDir);
+
+            Assert.Null(afterDiscard);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
     }
 
     [Fact]

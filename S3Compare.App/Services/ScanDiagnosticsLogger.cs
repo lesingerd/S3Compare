@@ -15,7 +15,7 @@ public class ScanDiagnosticsLogger : IAsyncDisposable
 
     public ScanDiagnosticsLogger(string? customLogDirectory = null)
     {
-        string dir = customLogDirectory ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+        string dir = customLogDirectory ?? AppPaths.LogsDirectory;
         if (!Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);

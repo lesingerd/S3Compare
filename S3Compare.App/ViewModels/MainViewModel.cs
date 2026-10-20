@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Data;
 using System.Windows.Input;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using S3Compare.App.Models;
 using S3Compare.App.Services;
@@ -16,6 +17,17 @@ public class MainViewModel : INotifyPropertyChanged
 {
     private BucketComparisonEngine? _engine;
     private CancellationTokenSource? _cts;
+    private TaskCompletionSource? _runCompletion;
+    private string? _sessionCsvPath;
+
+    // Differences travel engine thread -> queue -> UI timer; the grid keeps only the newest rows (all rows are in the session CSV)
+    private const int MaxUiDifferences = 2000;
+    private const int MaxDifferencesPerTick = 500;
+    private readonly ConcurrentQueue<ObjectDifference> _diffQueue = new();
+    private DispatcherTimer? _diffTimer;
+
+    private CancellationTokenSource? _checkpointDebounceCts;
+    private int _checkpointCheckTicket;
 
     // Presets
     public ObservableCollection<S3EndpointPreset> Endpoints { get; }
@@ -90,7 +102,8 @@ public class MainViewModel : INotifyPropertyChanged
         "Size Mismatch",
         "ETag Mismatch",
         "Content Mismatch",
-        "Possible Gap (Both Sides)"
+        "Possible Gap (Both Sides)",
+        "Content Check Error"
     };
 
     // Commands
@@ -125,7 +138,7 @@ public class MainViewModel : INotifyPropertyChanged
         TestConnectionBCommand = new RelayCommand(async () => await TestConnectionBAsync(), () => !IsRunning && !IsTestingB);
         FetchBucketsACommand = new RelayCommand(async () => await FetchBucketsAAsync(), () => !IsRunning && !IsFetchingBucketsA);
         FetchBucketsBCommand = new RelayCommand(async () => await FetchBucketsBAsync(), () => !IsRunning && !IsFetchingBucketsB);
-        ExportReportCommand = new RelayCommand(async () => await ExportReportAsync(), () => Differences.Count > 0 && !IsRunning);
+        ExportReportCommand = new RelayCommand(async () => await ExportReportAsync(), () => (Differences.Count > 0 || Statistics.TotalDifferences > 0) && !IsRunning);
         ClearResultsCommand = new RelayCommand(ClearResults, () => !IsRunning);
         BrowseLiveReportPathCommand = new RelayCommand(BrowseLiveReportPath);
     }
@@ -155,7 +168,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             if (SetField(ref _endpointUrlA, value))
             {
-                _ = CheckForCheckpointsAsync();
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -173,7 +186,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             if (SetField(ref _bucketNameA, value))
             {
-                _ = CheckForCheckpointsAsync();
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -197,7 +210,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             if (SetField(ref _prefixA, value))
             {
-                _ = CheckForCheckpointsAsync();
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -211,13 +224,25 @@ public class MainViewModel : INotifyPropertyChanged
     public bool IsTestingA
     {
         get => _isTestingA;
-        set => SetField(ref _isTestingA, value);
+        set
+        {
+            if (SetField(ref _isTestingA, value))
+            {
+                InvalidateCommands();
+            }
+        }
     }
 
     public bool IsFetchingBucketsA
     {
         get => _isFetchingBucketsA;
-        set => SetField(ref _isFetchingBucketsA, value);
+        set
+        {
+            if (SetField(ref _isFetchingBucketsA, value))
+            {
+                InvalidateCommands();
+            }
+        }
     }
 
     public S3EndpointPreset SelectedPresetB
@@ -243,7 +268,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             if (SetField(ref _endpointUrlB, value))
             {
-                _ = CheckForCheckpointsAsync();
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -261,7 +286,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             if (SetField(ref _bucketNameB, value))
             {
-                _ = CheckForCheckpointsAsync();
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -285,7 +310,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             if (SetField(ref _prefixB, value))
             {
-                _ = CheckForCheckpointsAsync();
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -299,13 +324,25 @@ public class MainViewModel : INotifyPropertyChanged
     public bool IsTestingB
     {
         get => _isTestingB;
-        set => SetField(ref _isTestingB, value);
+        set
+        {
+            if (SetField(ref _isTestingB, value))
+            {
+                InvalidateCommands();
+            }
+        }
     }
 
     public bool IsFetchingBucketsB
     {
         get => _isFetchingBucketsB;
-        set => SetField(ref _isFetchingBucketsB, value);
+        set
+        {
+            if (SetField(ref _isFetchingBucketsB, value))
+            {
+                InvalidateCommands();
+            }
+        }
     }
 
     public bool IsListingOnlyMode
@@ -316,6 +353,7 @@ public class MainViewModel : INotifyPropertyChanged
             if (SetField(ref _isListingOnlyMode, value))
             {
                 OnPropertyChanged(nameof(IsFullDataMode));
+                ScheduleCheckpointCheck();
             }
         }
     }
@@ -359,7 +397,13 @@ public class MainViewModel : INotifyPropertyChanged
     public bool HasResumableCheckpoint
     {
         get => _hasResumableCheckpoint;
-        set => SetField(ref _hasResumableCheckpoint, value);
+        set
+        {
+            if (SetField(ref _hasResumableCheckpoint, value))
+            {
+                InvalidateCommands();
+            }
+        }
     }
 
     public string CheckpointBannerText
@@ -382,6 +426,7 @@ public class MainViewModel : INotifyPropertyChanged
             if (SetField(ref _isRunning, value))
             {
                 OnPropertyChanged(nameof(CanEditConfig));
+                InvalidateCommands();
             }
         }
     }
@@ -391,7 +436,13 @@ public class MainViewModel : INotifyPropertyChanged
     public bool IsPaused
     {
         get => _isPaused;
-        set => SetField(ref _isPaused, value);
+        set
+        {
+            if (SetField(ref _isPaused, value))
+            {
+                InvalidateCommands();
+            }
+        }
     }
 
     public string StatusMessage
@@ -479,12 +530,37 @@ public class MainViewModel : INotifyPropertyChanged
             "ETag Mismatch" => diff.Type == DifferenceType.ETagMismatch,
             "Content Mismatch" => diff.Type == DifferenceType.ContentMismatch,
             "Possible Gap (Both Sides)" => diff.Type == DifferenceType.PossibleMissingOnBothSides,
+            "Content Check Error" => diff.Type == DifferenceType.ContentCheckError,
             _ => true
         };
     }
 
+    /// <summary>Config fields change per keystroke; wait for typing to settle before touching the disk.</summary>
+    private void ScheduleCheckpointCheck()
+    {
+        _checkpointDebounceCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _checkpointDebounceCts = cts;
+        _ = DebouncedCheckpointCheckAsync(cts.Token);
+    }
+
+    private async Task DebouncedCheckpointCheckAsync(CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(400, token);
+            await CheckForCheckpointsAsync();
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer edit
+        }
+    }
+
     public async Task CheckForCheckpointsAsync()
     {
+        int ticket = ++_checkpointCheckTicket;
+
         if (IsRunning || string.IsNullOrWhiteSpace(BucketNameA) || string.IsNullOrWhiteSpace(BucketNameB))
         {
             HasResumableCheckpoint = false;
@@ -492,17 +568,17 @@ public class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        var cp = await CheckpointManager.FindCheckpointAsync(BucketNameA, EndpointUrlA, PrefixA, BucketNameB, EndpointUrlB, PrefixB);
-        if (cp != null && !string.IsNullOrWhiteSpace(cp.LastEvaluatedKey))
+        var mode = IsListingOnlyMode ? ComparisonMode.ListingOnly : ComparisonMode.FullData;
+        var cp = await CheckpointManager.FindCheckpointAsync(BucketNameA, EndpointUrlA, PrefixA, BucketNameB, EndpointUrlB, PrefixB, mode);
+
+        // A newer check started while we were reading; its result wins
+        if (ticket != _checkpointCheckTicket) return;
+
+        if (cp != null && !string.IsNullOrEmpty(cp.LastEvaluatedKey))
         {
             ActiveCheckpoint = cp;
             HasResumableCheckpoint = true;
             CheckpointBannerText = $"Found saved scan checkpoint at key '{cp.LastEvaluatedKey}' ({cp.ObjectsCompared:N0} objects evaluated, {cp.TotalDifferences:N0} diffs).";
-            if (!string.IsNullOrWhiteSpace(cp.LiveReportCsvPath))
-            {
-                LiveReportPath = cp.LiveReportCsvPath;
-                AutoSaveLiveReport = true;
-            }
         }
         else
         {
@@ -710,6 +786,7 @@ public class MainViewModel : INotifyPropertyChanged
 
     private void ClearResults()
     {
+        _sessionCsvPath = null;
         Differences.Clear();
         RecentItemsA.Clear();
         RecentItemsB.Clear();
@@ -752,131 +829,107 @@ public class MainViewModel : INotifyPropertyChanged
         }
 
         ScanCheckpoint? checkpointToUse = isResuming ? ActiveCheckpoint : null;
-
-        if (!isResuming)
-        {
-            ClearResults();
-        }
-
-        IsRunning = true;
-        IsPaused = false;
-        StatusMessage = isResuming 
-            ? $"Resuming streaming scan from checkpoint key '{checkpointToUse?.LastEvaluatedKey}'..." 
-            : "Initializing streaming comparison...";
-        StatusA = "Connecting...";
-        StatusB = "Connecting...";
-
-        var configA = new S3BucketConfig
-        {
-            EndpointUrl = EndpointUrlA,
-            Region = RegionA,
-            BucketName = BucketNameA,
-            AccessKey = AccessKeyA,
-            SecretKey = SecretKeyA,
-            Prefix = PrefixA
-        };
-
-        var configB = new S3BucketConfig
-        {
-            EndpointUrl = EndpointUrlB,
-            Region = RegionB,
-            BucketName = BucketNameB,
-            AccessKey = AccessKeyB,
-            SecretKey = SecretKeyB,
-            Prefix = PrefixB
-        };
-
-        var mode = IsListingOnlyMode ? ComparisonMode.ListingOnly : ComparisonMode.FullData;
-        string? csvPath = (AutoSaveLiveReport && !string.IsNullOrWhiteSpace(LiveReportPath)) ? LiveReportPath : null;
-
-        _cts = new CancellationTokenSource();
-        _engine = new BucketComparisonEngine(
-            configA, 
-            configB, 
-            mode, 
-            csvPath, 
-            checkpointToUse, 
-            DetectSequenceGaps, 
-            MaxSequenceGapThreshold);
-
-        var diffQueue = new ConcurrentQueue<ObjectDifference>();
-
-        _engine.ProgressUpdated += stats =>
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                Statistics = stats;
-                CurrentKeyA = stats.CurrentKeyA;
-                CurrentKeyB = stats.CurrentKeyB;
-                ObjectsReadA = stats.BucketAObjectsRead;
-                ObjectsReadB = stats.BucketBObjectsRead;
-                BytesReadA = S3ObjectSummary.FormatSize(stats.BucketABytesRead);
-                BytesReadB = S3ObjectSummary.FormatSize(stats.BucketBBytesRead);
-                StatusA = $"Paging ({stats.BucketAObjectsRead:N0} objects read)";
-                StatusB = $"Paging ({stats.BucketBObjectsRead:N0} objects read)";
-                StatusMessage = $"Streaming comparison in progress... {stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | RAM: {stats.WorkingSetMB:F0} MB";
-
-                // Dequeue up to 40 differences per tick to keep WPF Dispatcher silky smooth
-                int added = 0;
-                while (diffQueue.TryDequeue(out var diff) && added < 40)
-                {
-                    if (Differences.Count >= 2000)
-                    {
-                        Differences.RemoveAt(0);
-                    }
-                    Differences.Add(diff);
-                    added++;
-                }
-            });
-        };
-
-        _engine.DifferenceFound += diff =>
-        {
-            diffQueue.Enqueue(diff);
-        };
-
-        _engine.PageLoadedA += page =>
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                RecentItemsA.Clear();
-                int take = Math.Min(30, page.Count);
-                for (int i = 0; i < take; i++)
-                {
-                    RecentItemsA.Add(page[i]);
-                }
-            });
-        };
-
-        _engine.PageLoadedB += page =>
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                RecentItemsB.Clear();
-                int take = Math.Min(30, page.Count);
-                for (int i = 0; i < take; i++)
-                {
-                    RecentItemsB.Add(page[i]);
-                }
-            });
-        };
+        var cts = new CancellationTokenSource();
+        _cts = cts;
+        _runCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         try
         {
-            var finalStats = await Task.Run(() => _engine.RunAsync(_cts.Token));
+            IsRunning = true;
+            IsPaused = false;
 
-            // Flush remaining differences to UI
-            Application.Current.Dispatcher.Invoke(() =>
+            if (!isResuming)
             {
-                while (diffQueue.TryDequeue(out var diff))
+                ClearResults();
+            }
+
+            StatusMessage = isResuming
+                ? $"Resuming streaming scan from checkpoint key '{checkpointToUse?.LastEvaluatedKey}'..."
+                : "Initializing streaming comparison...";
+            StatusA = "Connecting...";
+            StatusB = "Connecting...";
+
+            var configA = new S3BucketConfig
+            {
+                EndpointUrl = EndpointUrlA,
+                Region = RegionA,
+                BucketName = BucketNameA,
+                AccessKey = AccessKeyA,
+                SecretKey = SecretKeyA,
+                Prefix = PrefixA
+            };
+
+            var configB = new S3BucketConfig
+            {
+                EndpointUrl = EndpointUrlB,
+                Region = RegionB,
+                BucketName = BucketNameB,
+                AccessKey = AccessKeyB,
+                SecretKey = SecretKeyB,
+                Prefix = PrefixB
+            };
+
+            var mode = IsListingOnlyMode ? ComparisonMode.ListingOnly : ComparisonMode.FullData;
+
+            // Every difference is always written to a CSV on disk; it is the source for exports and for resuming.
+            string csvPath;
+            if (checkpointToUse != null && !string.IsNullOrWhiteSpace(checkpointToUse.LiveReportCsvPath))
+            {
+                csvPath = checkpointToUse.LiveReportCsvPath;
+            }
+            else if (AutoSaveLiveReport && !string.IsNullOrWhiteSpace(LiveReportPath))
+            {
+                csvPath = LiveReportPath;
+            }
+            else
+            {
+                PurgeOldSessionReports();
+                csvPath = Path.Combine(AppPaths.SessionReportsDirectory, $"session_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+            }
+            _sessionCsvPath = csvPath;
+
+            var engine = new BucketComparisonEngine(
+                configA,
+                configB,
+                mode,
+                csvPath,
+                checkpointToUse,
+                DetectSequenceGaps,
+                MaxSequenceGapThreshold);
+            _engine = engine;
+
+            var dispatcher = Application.Current?.Dispatcher;
+            _diffQueue.Clear();
+
+            // Differences are queued by the engine thread and drained in batches on the UI thread by a timer,
+            // so the engine never blocks on (or is killed by) the UI.
+            _diffTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(100) };
+            _diffTimer.Tick += (_, _) => DrainDifferences(MaxDifferencesPerTick);
+            _diffTimer.Start();
+
+            engine.ProgressUpdated += stats =>
+            {
+                dispatcher?.InvokeAsync(() =>
                 {
-                    if (Differences.Count >= 2000)
-                    {
-                        Differences.RemoveAt(0);
-                    }
-                    Differences.Add(diff);
-                }
-            });
+                    Statistics = stats;
+                    CurrentKeyA = stats.CurrentKeyA;
+                    CurrentKeyB = stats.CurrentKeyB;
+                    ObjectsReadA = stats.BucketAObjectsRead;
+                    ObjectsReadB = stats.BucketBObjectsRead;
+                    BytesReadA = S3ObjectSummary.FormatSize(stats.BucketABytesRead);
+                    BytesReadB = S3ObjectSummary.FormatSize(stats.BucketBBytesRead);
+                    StatusA = $"Paging ({stats.BucketAObjectsRead:N0} objects read)";
+                    StatusB = $"Paging ({stats.BucketBObjectsRead:N0} objects read)";
+                    StatusMessage = $"Streaming comparison in progress... {stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | RAM: {stats.WorkingSetMB:F0} MB";
+                });
+            };
+
+            engine.DifferenceFound += diff => _diffQueue.Enqueue(diff);
+
+            engine.PageLoadedA += page => ShowRecentItems(dispatcher, RecentItemsA, page);
+            engine.PageLoadedB += page => ShowRecentItems(dispatcher, RecentItemsB, page);
+
+            var finalStats = await Task.Run(() => engine.RunAsync(cts.Token));
 
             StatusMessage = $"Comparison Complete! Evaluated {finalStats.ObjectsCompared:N0} items. Found {finalStats.TotalDifferences:N0} differences, {finalStats.MatchedCount:N0} matched.";
             StatusA = "Complete";
@@ -884,12 +937,12 @@ public class MainViewModel : INotifyPropertyChanged
             HasResumableCheckpoint = false;
             ActiveCheckpoint = null;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
+            // Only a user stop is a stop; a timeout (also an OperationCanceledException) falls through to the error handler.
             StatusMessage = "Comparison paused or stopped by user. Checkpoint saved for resuming.";
             StatusA = "Stopped";
             StatusB = "Stopped";
-            _ = CheckForCheckpointsAsync();
         }
         catch (Exception ex)
         {
@@ -897,20 +950,146 @@ public class MainViewModel : INotifyPropertyChanged
             StatusA = "Error";
             StatusB = "Error";
             MessageBox.Show($"Comparison stopped due to error:\n\n{ex.Message}\n\nA checkpoint has been preserved if you wish to resume after addressing the issue.", "Comparison Error", MessageBoxButton.OK, MessageBoxImage.Error);
-            _ = CheckForCheckpointsAsync();
         }
         finally
         {
+            // Always show whatever the engine queued, whether it finished, was stopped or failed
+            _diffTimer?.Stop();
+            _diffTimer = null;
+            DrainDifferences(MaxUiDifferences);
+
             IsRunning = false;
             IsPaused = false;
-            _cts?.Dispose();
+            cts.Dispose();
             _cts = null;
             _engine = null;
+            _runCompletion?.TrySetResult();
+            _ = CheckForCheckpointsAsync();
+        }
+    }
+
+    /// <summary>
+    /// Cancels a running scan and waits (bounded) for the engine to write its final checkpoint and flush the live CSV.
+    /// Call before closing the window.
+    /// </summary>
+    public async Task ShutdownAsync()
+    {
+        var completion = _runCompletion;
+        if (!IsRunning || completion == null) return;
+
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        _engine?.Resume();
+
+        await Task.WhenAny(completion.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+    }
+
+    private static void ShowRecentItems(Dispatcher? dispatcher, ObservableCollection<S3ObjectSummary> target, List<S3ObjectSummary> page)
+    {
+        if (dispatcher == null) return;
+        var snapshot = page.Take(30).ToList();
+        dispatcher.InvokeAsync(() =>
+        {
+            target.Clear();
+            foreach (var item in snapshot)
+            {
+                target.Add(item);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Moves queued differences into the UI collection. The grid only shows the newest <see cref="MaxUiDifferences"/>
+    /// rows (the complete set is in the session CSV), so anything beyond <paramref name="maxBatch"/> is skipped, oldest first.
+    /// </summary>
+    private void DrainDifferences(int maxBatch)
+    {
+        int pending = _diffQueue.Count;
+        if (pending == 0) return;
+
+        int skip = Math.Max(0, pending - maxBatch);
+        var batch = new List<ObjectDifference>(Math.Min(pending, maxBatch));
+        for (int taken = 0; taken < pending && _diffQueue.TryDequeue(out var diff); taken++)
+        {
+            if (taken >= skip)
+            {
+                batch.Add(diff);
+            }
+        }
+
+        int overflow = Differences.Count + batch.Count - MaxUiDifferences;
+        if (overflow >= Differences.Count)
+        {
+            Differences.Clear();
+        }
+        else
+        {
+            for (int i = 0; i < overflow; i++)
+            {
+                Differences.RemoveAt(0);
+            }
+        }
+
+        foreach (var diff in batch)
+        {
+            Differences.Add(diff);
+        }
+    }
+
+    private static void PurgeOldSessionReports()
+    {
+        try
+        {
+            var dir = AppPaths.SessionReportsDirectory;
+            if (!Directory.Exists(dir)) return;
+            foreach (var file in Directory.GetFiles(dir, "session_*.csv"))
+            {
+                if (File.GetLastWriteTimeUtc(file) < DateTime.UtcNow.AddDays(-14))
+                {
+                    File.Delete(file);
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort housekeeping
+        }
+    }
+
+    private static void InvalidateCommands()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher == null || dispatcher.CheckAccess())
+        {
+            CommandManager.InvalidateRequerySuggested();
+        }
+        else
+        {
+            dispatcher.InvokeAsync(() => CommandManager.InvalidateRequerySuggested());
         }
     }
 
     private async Task ExportReportAsync()
     {
+        string? sessionCsv = _sessionCsvPath;
+        bool haveSessionCsv = !string.IsNullOrEmpty(sessionCsv) && File.Exists(sessionCsv);
+
+        if (!haveSessionCsv && Statistics.TotalDifferences > Differences.Count)
+        {
+            var proceed = MessageBox.Show(
+                $"The full difference report file is no longer available. Only the {Differences.Count:N0} most recent differences (of {Statistics.TotalDifferences:N0}) can be exported from the grid.\n\nExport this partial list anyway?",
+                "Partial Export",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+            if (proceed != MessageBoxResult.Yes)
+                return;
+        }
+
         var sfd = new SaveFileDialog
         {
             Title = "Export Differences Report",
@@ -922,15 +1101,29 @@ public class MainViewModel : INotifyPropertyChanged
         {
             try
             {
-                if (sfd.FileName.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                string target = sfd.FileName;
+                var stats = Statistics;
+                bool json = target.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
+                var gridCopy = haveSessionCsv ? null : Differences.ToList();
+
+                // Heavy file I/O (the report can hold millions of rows) stays off the UI thread
+                await Task.Run(async () =>
                 {
-                    await ReportExporter.ExportToJsonAsync(sfd.FileName, Differences, Statistics);
-                }
-                else
-                {
-                    await ReportExporter.ExportToCsvAsync(sfd.FileName, Differences, Statistics);
-                }
-                MessageBox.Show($"Report exported successfully to:\n{sfd.FileName}", "Export Succeeded", MessageBoxButton.OK, MessageBoxImage.Information);
+                    if (json)
+                    {
+                        IEnumerable<ObjectDifference> source = haveSessionCsv ? CsvReport.ReadDifferences(sessionCsv!) : gridCopy!;
+                        await ReportExporter.ExportToJsonAsync(target, source, stats);
+                    }
+                    else if (haveSessionCsv)
+                    {
+                        await ReportExporter.ExportFromSessionCsvAsync(target, sessionCsv!, stats);
+                    }
+                    else
+                    {
+                        await ReportExporter.ExportToCsvAsync(target, gridCopy!, stats);
+                    }
+                });
+                MessageBox.Show($"Report exported successfully to:\n{target}", "Export Succeeded", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {

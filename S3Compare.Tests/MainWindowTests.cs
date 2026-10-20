@@ -15,12 +15,9 @@ public class MainWindowTests
         {
             try
             {
-                var vm = new MainViewModel();
-                Assert.NotNull(vm);
-
                 var window = new MainWindow();
                 Assert.NotNull(window);
-                Assert.NotNull(window.DataContext);
+                Assert.IsType<MainViewModel>(window.DataContext);
             }
             catch (Exception ex)
             {

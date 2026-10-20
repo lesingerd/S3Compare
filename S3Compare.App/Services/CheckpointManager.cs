@@ -12,7 +12,7 @@ public static class CheckpointManager
 
     public static string GetCheckpointDirectory(string? customBaseDir = null)
     {
-        string dir = Path.Combine(customBaseDir ?? AppDomain.CurrentDomain.BaseDirectory, "logs", "checkpoints");
+        string dir = Path.Combine(customBaseDir ?? AppPaths.DataDirectory, "logs", "checkpoints");
         if (!Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
@@ -20,9 +20,9 @@ public static class CheckpointManager
         return dir;
     }
 
-    public static string ComputeSessionHash(string bucketA, string endpointA, string prefixA, string bucketB, string endpointB, string prefixB)
+    public static string ComputeSessionHash(string bucketA, string endpointA, string prefixA, string bucketB, string endpointB, string prefixB, ComparisonMode mode)
     {
-        string raw = $"{bucketA.Trim().ToLowerInvariant()}|{endpointA.Trim().ToLowerInvariant()}|{prefixA.Trim()}|{bucketB.Trim().ToLowerInvariant()}|{endpointB.Trim().ToLowerInvariant()}|{prefixB.Trim()}";
+        string raw = $"{bucketA.Trim().ToLowerInvariant()}|{endpointA.Trim().ToLowerInvariant()}|{prefixA}|{bucketB.Trim().ToLowerInvariant()}|{endpointB.Trim().ToLowerInvariant()}|{prefixB}|{mode}";
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return Convert.ToHexString(hash)[..12].ToLowerInvariant();
     }
@@ -30,7 +30,7 @@ public static class CheckpointManager
     public static string GetCheckpointFilePath(ScanCheckpoint cp, string? customBaseDir = null)
     {
         string dir = GetCheckpointDirectory(customBaseDir);
-        string hash = ComputeSessionHash(cp.BucketNameA, cp.EndpointA, cp.PrefixA, cp.BucketNameB, cp.EndpointB, cp.PrefixB);
+        string hash = ComputeSessionHash(cp.BucketNameA, cp.EndpointA, cp.PrefixA, cp.BucketNameB, cp.EndpointB, cp.PrefixB, cp.Mode);
         string safeNameA = SanitizeFileName(cp.BucketNameA);
         string safeNameB = SanitizeFileName(cp.BucketNameB);
         return Path.Combine(dir, $"checkpoint_{safeNameA}_vs_{safeNameB}_{hash}.json");
@@ -46,12 +46,8 @@ public static class CheckpointManager
         string json = JsonSerializer.Serialize(checkpoint, JsonOptions);
         await File.WriteAllTextAsync(tempPath, json, Encoding.UTF8).ConfigureAwait(false);
 
-        // Atomic replace
-        if (File.Exists(targetPath))
-        {
-            File.Delete(targetPath);
-        }
-        File.Move(tempPath, targetPath);
+        // Atomic replace: the old checkpoint stays intact until the new one fully replaces it
+        File.Move(tempPath, targetPath, overwrite: true);
 
         return targetPath;
     }
@@ -63,20 +59,30 @@ public static class CheckpointManager
         string bucketB,
         string endpointB,
         string prefixB,
+        ComparisonMode mode,
         string? customBaseDir = null)
     {
         if (string.IsNullOrWhiteSpace(bucketA) || string.IsNullOrWhiteSpace(bucketB)) return null;
 
-        string dir = GetCheckpointDirectory(customBaseDir);
-        string hash = ComputeSessionHash(bucketA, endpointA, prefixA, bucketB, endpointB, prefixB);
-
-        var matchingFiles = Directory.GetFiles(dir, $"checkpoint_*_{hash}.json");
-        if (matchingFiles.Length == 0) return null;
-
         try
         {
+            string dir = GetCheckpointDirectory(customBaseDir);
+            string hash = ComputeSessionHash(bucketA, endpointA, prefixA, bucketB, endpointB, prefixB, mode);
+
+            var matchingFiles = Directory.GetFiles(dir, $"checkpoint_*_{hash}.json");
+            if (matchingFiles.Length == 0) return null;
+
             string content = await File.ReadAllTextAsync(matchingFiles[0], Encoding.UTF8).ConfigureAwait(false);
-            return JsonSerializer.Deserialize<ScanCheckpoint>(content, JsonOptions);
+            var cp = JsonSerializer.Deserialize<ScanCheckpoint>(content, JsonOptions);
+            if (cp == null) return null;
+
+            // Defend against hash collisions / hand-edited files
+            bool matches = cp.Mode == mode
+                && string.Equals(cp.BucketNameA.Trim(), bucketA.Trim(), StringComparison.OrdinalIgnoreCase)
+                && string.Equals(cp.BucketNameB.Trim(), bucketB.Trim(), StringComparison.OrdinalIgnoreCase)
+                && cp.PrefixA == prefixA
+                && cp.PrefixB == prefixB;
+            return matches ? cp : null;
         }
         catch
         {

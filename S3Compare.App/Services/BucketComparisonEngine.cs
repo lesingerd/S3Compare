@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using S3Compare.App.Models;
@@ -18,11 +19,21 @@ public class BucketComparisonEngine
     private readonly bool _detectSequenceGaps;
     private readonly int _maxSequenceGapThreshold;
     private readonly SequenceGapDetector? _gapDetector;
+    private readonly string _prefixA;
+    private readonly string _prefixB;
 
     private readonly ComparisonStatistics _stats = new();
     private readonly Stopwatch _stopwatch = new();
+    private readonly Stopwatch _pauseWatch = new();
     private long _differenceIdCounter = 0;
+
+    /// <summary>Last fully processed key, relative to each bucket's own prefix.</summary>
     private string _lastEvaluatedKey = string.Empty;
+
+    private FileStream? _csvStream;
+    private long _lastProgressMs;
+    private long _lastCheckpointMs;
+    private long _itemsSinceCheckpoint;
 
     private volatile bool _isPaused = false;
     private readonly SemaphoreSlim _pauseSemaphore = new(1, 1);
@@ -31,6 +42,12 @@ public class BucketComparisonEngine
     public event Action<ObjectDifference>? DifferenceFound;
     public event Action<List<S3ObjectSummary>>? PageLoadedA;
     public event Action<List<S3ObjectSummary>>? PageLoadedB;
+
+    /// <summary>
+    /// Optional override for FullData byte comparison of an object pair (A item, B item). Intended for tests;
+    /// when null the engine downloads both objects through its S3 clients.
+    /// </summary>
+    public Func<S3ObjectSummary, S3ObjectSummary, CancellationToken, Task<bool>>? ContentComparer { get; set; }
 
     public BucketComparisonEngine(
         S3BucketConfig configA,
@@ -43,6 +60,8 @@ public class BucketComparisonEngine
     {
         _configA = configA ?? throw new ArgumentNullException(nameof(configA));
         _configB = configB ?? throw new ArgumentNullException(nameof(configB));
+        _prefixA = configA.Prefix ?? string.Empty;
+        _prefixB = configB.Prefix ?? string.Empty;
         _mode = mode;
         _liveReportCsvPath = liveReportCsvPath;
         _resumeCheckpoint = resumeCheckpoint;
@@ -66,12 +85,18 @@ public class BucketComparisonEngine
         ComparisonMode mode,
         string? liveReportCsvPath = null,
         bool detectSequenceGaps = true,
-        int maxSequenceGapThreshold = 25)
+        int maxSequenceGapThreshold = 25,
+        string prefixA = "",
+        string prefixB = "",
+        ScanCheckpoint? resumeCheckpoint = null)
     {
         _providedStreamA = streamA ?? throw new ArgumentNullException(nameof(streamA));
         _providedStreamB = streamB ?? throw new ArgumentNullException(nameof(streamB));
+        _prefixA = prefixA ?? string.Empty;
+        _prefixB = prefixB ?? string.Empty;
         _mode = mode;
         _liveReportCsvPath = liveReportCsvPath;
+        _resumeCheckpoint = resumeCheckpoint;
         _detectSequenceGaps = detectSequenceGaps;
         _maxSequenceGapThreshold = maxSequenceGapThreshold;
 
@@ -79,6 +104,25 @@ public class BucketComparisonEngine
         {
             _gapDetector = new SequenceGapDetector(_maxSequenceGapThreshold);
         }
+
+        if (resumeCheckpoint != null)
+        {
+            InitializeStatsFromCheckpoint(resumeCheckpoint);
+        }
+    }
+
+    /// <summary>Strips the bucket's prefix so keys from buckets with different prefixes can be compared.</summary>
+    public static string ToRelativeKey(string key, string prefix)
+    {
+        return !string.IsNullOrEmpty(prefix) && key.StartsWith(prefix, StringComparison.Ordinal)
+            ? key.Substring(prefix.Length)
+            : key;
+    }
+
+    /// <summary>Builds the S3 StartAfter value for a bucket from the checkpoint's relative key.</summary>
+    public static string? BuildStartAfter(string prefix, string relativeKey)
+    {
+        return string.IsNullOrEmpty(relativeKey) ? null : (prefix ?? string.Empty) + relativeKey;
     }
 
     private void InitializeStatsFromCheckpoint(ScanCheckpoint cp)
@@ -91,6 +135,7 @@ public class BucketComparisonEngine
         _stats.SizeMismatchCount = cp.SizeMismatchCount;
         _stats.ETagMismatchCount = cp.ETagMismatchCount;
         _stats.ContentMismatchCount = cp.ContentMismatchCount;
+        _stats.ContentCheckErrorCount = cp.ContentCheckErrorCount;
         _stats.SequenceGapCount = cp.SequenceGapCount;
         _stats.ElapsedTime = TimeSpan.FromSeconds(cp.ElapsedSeconds);
         _lastEvaluatedKey = cp.LastEvaluatedKey;
@@ -102,6 +147,7 @@ public class BucketComparisonEngine
         if (!_isPaused)
         {
             _isPaused = true;
+            _pauseWatch.Start();
             _pauseSemaphore.WaitAsync();
         }
     }
@@ -111,6 +157,7 @@ public class BucketComparisonEngine
         if (_isPaused)
         {
             _isPaused = false;
+            _pauseWatch.Stop();
             if (_pauseSemaphore.CurrentCount == 0)
             {
                 _pauseSemaphore.Release();
@@ -123,12 +170,18 @@ public class BucketComparisonEngine
     public async Task<ComparisonStatistics> RunAsync(CancellationToken cancellationToken = default)
     {
         _stopwatch.Restart();
+        _pauseWatch.Reset();
+        if (_isPaused) _pauseWatch.Start();
+        _lastProgressMs = 0;
+        _lastCheckpointMs = 0;
+        _itemsSinceCheckpoint = 0;
 
         IAmazonS3? clientA = null;
         IAmazonS3? clientB = null;
         IS3ObjectStream? enumA = null;
         IS3ObjectStream? enumB = null;
         ScanDiagnosticsLogger? diagnosticsLogger = null;
+        bool completed = false;
 
         StreamWriter? csvWriter = null;
         if (!string.IsNullOrWhiteSpace(_liveReportCsvPath))
@@ -139,13 +192,28 @@ public class BucketComparisonEngine
                 Directory.CreateDirectory(dir);
             }
 
-            bool isNewFile = !File.Exists(_liveReportCsvPath) || new FileInfo(_liveReportCsvPath).Length == 0;
-            var fileStream = new FileStream(_liveReportCsvPath, FileMode.Append, FileAccess.Write, FileShare.Read);
-            csvWriter = new StreamWriter(fileStream);
-
-            if (isNewFile)
+            if (_resumeCheckpoint != null)
             {
-                await csvWriter.WriteLineAsync("Id,Key,Type,Details,BucketASize,BucketBSize,BucketAETag,BucketBETag,BucketALastModified,BucketBLastModified,BucketAStorageClass,BucketBStorageClass,MetadataSummary,Timestamp").ConfigureAwait(false);
+                // Resume: keep rows written up to the checkpoint and drop anything after it (those items are re-processed).
+                _csvStream = new FileStream(_liveReportCsvPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+                long keep = _resumeCheckpoint.LiveReportCsvBytes;
+                if (keep > 0 && _csvStream.Length > keep)
+                {
+                    _csvStream.SetLength(keep);
+                }
+                _csvStream.Seek(0, SeekOrigin.End);
+            }
+            else
+            {
+                // Fresh scan: never append to a previous scan's report.
+                _csvStream = new FileStream(_liveReportCsvPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            }
+
+            csvWriter = new StreamWriter(_csvStream, CsvReport.Utf8WithBom);
+
+            if (_csvStream.Length == 0)
+            {
+                await csvWriter.WriteLineAsync(CsvReport.Header).ConfigureAwait(false);
                 await csvWriter.FlushAsync().ConfigureAwait(false);
             }
         }
@@ -168,21 +236,23 @@ public class BucketComparisonEngine
                 clientA = S3ClientFactory.CreateClient(_configA);
                 clientB = S3ClientFactory.CreateClient(_configB);
 
-                string? startAfter = _resumeCheckpoint?.LastEvaluatedKey;
+                // Each bucket resumes from its own prefix + the shared relative key
+                string? startAfterA = BuildStartAfter(_prefixA, _lastEvaluatedKey);
+                string? startAfterB = BuildStartAfter(_prefixB, _lastEvaluatedKey);
 
                 enumA = new S3PagingEnumerator(
                     clientA,
                     _configA.BucketName,
                     _configA.Prefix,
-                    startAfter,
-                    (page, _) => PageLoadedA?.Invoke(page));
+                    startAfterA,
+                    (page, _) => SafeRaise(PageLoadedA, page));
 
                 enumB = new S3PagingEnumerator(
                     clientB,
                     _configB.BucketName,
                     _configB.Prefix,
-                    startAfter,
-                    (page, _) => PageLoadedB?.Invoke(page));
+                    startAfterB,
+                    (page, _) => SafeRaise(PageLoadedB, page));
             }
             else
             {
@@ -192,201 +262,88 @@ public class BucketComparisonEngine
             bool hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
             bool hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
 
-            long lastProgressReportTime = 0;
-            long lastCheckpointTime = 0;
-            long itemsSinceLastCheckpoint = 0;
-
-            while (hasA && hasB)
+            while (hasA || hasB)
             {
                 await CheckPauseAsync(cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var itemA = enumA.Current!;
-                var itemB = enumB.Current!;
+                S3ObjectSummary? itemA = hasA ? enumA.Current : null;
+                S3ObjectSummary? itemB = hasB ? enumB.Current : null;
+                string? relA = null;
+                string? relB = null;
 
-                _stats.CurrentKeyA = itemA.Key;
-                _stats.CurrentKeyB = itemB.Key;
+                if (itemA != null)
+                {
+                    _stats.CurrentKeyA = itemA.Key;
+                    relA = ToRelativeKey(itemA.Key, _prefixA);
+                }
+                if (itemB != null)
+                {
+                    _stats.CurrentKeyB = itemB.Key;
+                    relB = ToRelativeKey(itemB.Key, _prefixB);
+                }
 
-                int cmp = string.CompareOrdinal(itemA.Key, itemB.Key);
+                // cmp < 0: only in A (so far); cmp > 0: only in B; cmp == 0: in both
+                int cmp = itemB == null ? -1
+                    : itemA == null ? 1
+                    : Utf8KeyComparer.Instance.Compare(relA, relB);
 
+                string processedRelativeKey;
                 if (cmp == 0)
                 {
-                    _stats.ObjectsCompared++;
-                    _lastEvaluatedKey = itemA.Key;
-
-                    // Synthetic sequence gap check
-                    CheckSequenceGap(itemA.Key, csvWriter);
-
-                    await CompareSameKeyAsync(clientA, clientB, itemA, itemB, csvWriter, cancellationToken).ConfigureAwait(false);
-
-                    hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
-                    hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
+                    processedRelativeKey = relA!;
+                    await CompareSameKeyAsync(clientA, clientB, itemA!, itemB!, relA!, csvWriter, cancellationToken).ConfigureAwait(false);
                 }
                 else if (cmp < 0)
                 {
-                    // itemA exists in Bucket A but missing in Bucket B
-                    _stats.ObjectsCompared++;
-                    _lastEvaluatedKey = itemA.Key;
-
-                    CheckSequenceGap(itemA.Key, csvWriter);
-
+                    processedRelativeKey = relA!;
                     var diff = new ObjectDifference
                     {
                         Id = ++_differenceIdCounter,
-                        Key = itemA.Key,
+                        Key = DisplayKey(itemA!, relA!),
                         Type = DifferenceType.MissingInBucketB,
-                        Details = $"Object exists in Bucket A but is missing in Bucket B. Size: {itemA.FormattedSize}, ETag: {itemA.ETag}, StorageClass: {itemA.StorageClass}, LastModified: {itemA.LastModified:yyyy-MM-dd HH:mm:ss}",
+                        Details = $"Object exists in Bucket A but is missing in Bucket B. Size: {itemA!.FormattedSize}, ETag: {itemA.ETag}, StorageClass: {itemA.StorageClass}, LastModified: {itemA.LastModified:yyyy-MM-dd HH:mm:ss}",
                         BucketASize = itemA.Size,
-                        BucketBSize = null,
                         BucketAETag = itemA.ETag,
-                        BucketBETag = null,
                         BucketALastModified = itemA.LastModified,
-                        BucketBLastModified = null,
-                        BucketAStorageClass = itemA.StorageClass,
-                        BucketBStorageClass = null
+                        BucketAStorageClass = itemA.StorageClass
                     };
                     await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
                     _stats.MissingInBucketBCount++;
                     _stats.TotalDifferences++;
-
-                    hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
-                    // itemB exists in Bucket B but missing in Bucket A
-                    _stats.ObjectsCompared++;
-                    _lastEvaluatedKey = itemB.Key;
-
-                    CheckSequenceGap(itemB.Key, csvWriter);
-
+                    processedRelativeKey = relB!;
                     var diff = new ObjectDifference
                     {
                         Id = ++_differenceIdCounter,
-                        Key = itemB.Key,
+                        Key = DisplayKey(itemB!, relB!),
                         Type = DifferenceType.MissingInBucketA,
-                        Details = $"Object exists in Bucket B but is missing in Bucket A. Size: {itemB.FormattedSize}, ETag: {itemB.ETag}, StorageClass: {itemB.StorageClass}, LastModified: {itemB.LastModified:yyyy-MM-dd HH:mm:ss}",
-                        BucketASize = null,
+                        Details = $"Object exists in Bucket B but is missing in Bucket A. Size: {itemB!.FormattedSize}, ETag: {itemB.ETag}, StorageClass: {itemB.StorageClass}, LastModified: {itemB.LastModified:yyyy-MM-dd HH:mm:ss}",
                         BucketBSize = itemB.Size,
-                        BucketAETag = null,
                         BucketBETag = itemB.ETag,
-                        BucketALastModified = null,
                         BucketBLastModified = itemB.LastModified,
-                        BucketAStorageClass = null,
                         BucketBStorageClass = itemB.StorageClass
                     };
                     await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
                     _stats.MissingInBucketACount++;
                     _stats.TotalDifferences++;
-
-                    hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                UpdateLiveStats(enumA, enumB);
-                itemsSinceLastCheckpoint++;
+                await CheckSequenceGapAsync(processedRelativeKey, csvWriter).ConfigureAwait(false);
 
-                // Heartbeat & Checkpoint check
-                long elapsedMs = _stopwatch.ElapsedMilliseconds;
-                if (elapsedMs - lastCheckpointTime > 5000 || itemsSinceLastCheckpoint >= 10000)
-                {
-                    lastCheckpointTime = elapsedMs;
-                    itemsSinceLastCheckpoint = 0;
-                    await SaveCheckpointIfNeededAsync(diagnosticsLogger).ConfigureAwait(false);
-                }
-
-                if (elapsedMs - lastProgressReportTime > 200)
-                {
-                    lastProgressReportTime = elapsedMs;
-                    if (diagnosticsLogger != null)
-                    {
-                        await diagnosticsLogger.LogHeartbeatAsync(
-                            _stats.ObjectsCompared,
-                            _stats.ItemsPerSecond,
-                            _stats.CurrentKeyA,
-                            _stats.CurrentKeyB,
-                            _stats.TotalDifferences,
-                            _stats.ElapsedTime).ConfigureAwait(false);
-                    }
-                    ProgressUpdated?.Invoke(CloneStats());
-                }
-            }
-
-            // Drain remaining items in Bucket A
-            while (hasA)
-            {
-                await CheckPauseAsync(cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var itemA = enumA.Current!;
-                _stats.CurrentKeyA = itemA.Key;
+                // Commit: the item is fully processed, so a checkpoint taken from here on may skip it.
                 _stats.ObjectsCompared++;
-                _lastEvaluatedKey = itemA.Key;
+                _lastEvaluatedKey = processedRelativeKey;
 
-                CheckSequenceGap(itemA.Key, csvWriter);
+                if (cmp <= 0) hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
+                if (cmp >= 0) hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
 
-                var diff = new ObjectDifference
-                {
-                    Id = ++_differenceIdCounter,
-                    Key = itemA.Key,
-                    Type = DifferenceType.MissingInBucketB,
-                    Details = $"Object exists in Bucket A only (Tail). Size: {itemA.FormattedSize}, ETag: {itemA.ETag}, StorageClass: {itemA.StorageClass}, LastModified: {itemA.LastModified:yyyy-MM-dd HH:mm:ss}",
-                    BucketASize = itemA.Size,
-                    BucketAETag = itemA.ETag,
-                    BucketALastModified = itemA.LastModified,
-                    BucketAStorageClass = itemA.StorageClass
-                };
-                await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
-                _stats.MissingInBucketBCount++;
-                _stats.TotalDifferences++;
-
-                hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
-                UpdateLiveStats(enumA, enumB);
-
-                if (_stopwatch.ElapsedMilliseconds - lastProgressReportTime > 200)
-                {
-                    lastProgressReportTime = _stopwatch.ElapsedMilliseconds;
-                    ProgressUpdated?.Invoke(CloneStats());
-                }
+                await TickAsync(enumA, enumB, diagnosticsLogger, csvWriter).ConfigureAwait(false);
             }
 
-            // Drain remaining items in Bucket B
-            while (hasB)
-            {
-                await CheckPauseAsync(cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var itemB = enumB.Current!;
-                _stats.CurrentKeyB = itemB.Key;
-                _stats.ObjectsCompared++;
-                _lastEvaluatedKey = itemB.Key;
-
-                CheckSequenceGap(itemB.Key, csvWriter);
-
-                var diff = new ObjectDifference
-                {
-                    Id = ++_differenceIdCounter,
-                    Key = itemB.Key,
-                    Type = DifferenceType.MissingInBucketA,
-                    Details = $"Object exists in Bucket B only (Tail). Size: {itemB.FormattedSize}, ETag: {itemB.ETag}, StorageClass: {itemB.StorageClass}, LastModified: {itemB.LastModified:yyyy-MM-dd HH:mm:ss}",
-                    BucketBSize = itemB.Size,
-                    BucketBETag = itemB.ETag,
-                    BucketBLastModified = itemB.LastModified,
-                    BucketBStorageClass = itemB.StorageClass
-                };
-                await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
-                _stats.MissingInBucketACount++;
-                _stats.TotalDifferences++;
-
-                hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
-                UpdateLiveStats(enumA, enumB);
-
-                if (_stopwatch.ElapsedMilliseconds - lastProgressReportTime > 200)
-                {
-                    lastProgressReportTime = _stopwatch.ElapsedMilliseconds;
-                    ProgressUpdated?.Invoke(CloneStats());
-                }
-            }
-
-            // If reached completion without cancellation, remove active checkpoint
+            // Completed without cancellation: remove the active checkpoint
             if (_configA != null && _configB != null)
             {
                 var finalCheckpoint = CreateCheckpointSnapshot();
@@ -396,6 +353,7 @@ public class BucketComparisonEngine
                     await diagnosticsLogger.LogInfoAsync($"Scan completed successfully. Total objects: {_stats.ObjectsCompared:N0}, Matched: {_stats.MatchedCount:N0}, Differences: {_stats.TotalDifferences:N0}").ConfigureAwait(false);
                 }
             }
+            completed = true;
         }
         catch (Exception ex)
         {
@@ -408,10 +366,28 @@ public class BucketComparisonEngine
         finally
         {
             _stopwatch.Stop();
+            _pauseWatch.Stop();
+
+            // Stopped or failed: persist where we got to (also flushes the live CSV to match the checkpoint)
+            if (!completed)
+            {
+                await SaveCheckpointIfNeededAsync(diagnosticsLogger, csvWriter).ConfigureAwait(false);
+            }
+
+            UpdateLiveStats(enumA, enumB);
+            SafeRaise(ProgressUpdated, CloneStats());
+
             if (csvWriter != null)
             {
-                await csvWriter.FlushAsync().ConfigureAwait(false);
-                await csvWriter.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    await csvWriter.FlushAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    await csvWriter.DisposeAsync().ConfigureAwait(false);
+                    _csvStream = null;
+                }
             }
             if (enumA != null) await enumA.DisposeAsync().ConfigureAwait(false);
             if (enumB != null) await enumB.DisposeAsync().ConfigureAwait(false);
@@ -424,31 +400,92 @@ public class BucketComparisonEngine
             }
         }
 
-        UpdateLiveStats(null, null);
-        ProgressUpdated?.Invoke(CloneStats());
         return CloneStats();
     }
 
-    private void CheckSequenceGap(string key, StreamWriter? csvWriter)
+    /// <summary>
+    /// Key shown to the user. With a shared prefix this is the full key; with different prefixes the
+    /// keys are only comparable relative to their prefixes, so the relative key is shown.
+    /// </summary>
+    private string DisplayKey(S3ObjectSummary item, string relativeKey)
+        => _prefixA == _prefixB ? item.Key : relativeKey;
+
+    private static void SafeRaise<T>(Action<T>? handler, T arg)
+    {
+        if (handler == null) return;
+        try
+        {
+            handler(arg);
+        }
+        catch
+        {
+            // A misbehaving subscriber (e.g. a closing window) must never abort the scan.
+        }
+    }
+
+    private async Task CheckSequenceGapAsync(string relativeKey, StreamWriter? csvWriter)
     {
         if (_gapDetector == null) return;
 
-        var gaps = _gapDetector.CheckKey(key, ref _differenceIdCounter);
+        var gaps = _gapDetector.CheckKey(relativeKey, ref _differenceIdCounter);
         foreach (var gap in gaps)
         {
-            _ = RecordDifferenceAsync(gap, csvWriter);
+            if (_prefixA == _prefixB)
+            {
+                gap.Key = _prefixA + gap.Key;
+            }
+            await RecordDifferenceAsync(gap, csvWriter).ConfigureAwait(false);
             _stats.SequenceGapCount++;
             _stats.TotalDifferences++;
         }
     }
 
-    private async Task SaveCheckpointIfNeededAsync(ScanDiagnosticsLogger? diagnosticsLogger)
+    /// <summary>Per-item bookkeeping; expensive work (stats, memory, UI notification) only runs on the ~200ms tick.</summary>
+    private async Task TickAsync(IS3ObjectStream enumA, IS3ObjectStream enumB, ScanDiagnosticsLogger? diagnosticsLogger, StreamWriter? csvWriter)
     {
-        if (_configA == null || _configB == null || string.IsNullOrWhiteSpace(_lastEvaluatedKey))
+        _itemsSinceCheckpoint++;
+        long elapsedMs = ActiveElapsedMs();
+
+        if (elapsedMs - _lastCheckpointMs > 5000 || _itemsSinceCheckpoint >= 10000)
+        {
+            _lastCheckpointMs = elapsedMs;
+            _itemsSinceCheckpoint = 0;
+            await SaveCheckpointIfNeededAsync(diagnosticsLogger, csvWriter).ConfigureAwait(false);
+        }
+
+        if (elapsedMs - _lastProgressMs > 200)
+        {
+            _lastProgressMs = elapsedMs;
+            UpdateLiveStats(enumA, enumB);
+            if (diagnosticsLogger != null)
+            {
+                await diagnosticsLogger.LogHeartbeatAsync(
+                    _stats.ObjectsCompared,
+                    _stats.ItemsPerSecond,
+                    _stats.CurrentKeyA,
+                    _stats.CurrentKeyB,
+                    _stats.TotalDifferences,
+                    _stats.ElapsedTime).ConfigureAwait(false);
+            }
+            SafeRaise(ProgressUpdated, CloneStats());
+        }
+    }
+
+    private long ActiveElapsedMs() => (long)(_stopwatch.Elapsed - _pauseWatch.Elapsed).TotalMilliseconds;
+
+    private async Task SaveCheckpointIfNeededAsync(ScanDiagnosticsLogger? diagnosticsLogger, StreamWriter? csvWriter)
+    {
+        if (_configA == null || _configB == null || string.IsNullOrEmpty(_lastEvaluatedKey))
             return;
 
         try
         {
+            // The CSV must be on disk before the checkpoint records its length
+            if (csvWriter != null)
+            {
+                await csvWriter.FlushAsync().ConfigureAwait(false);
+            }
+
             var cp = CreateCheckpointSnapshot();
             string path = await CheckpointManager.SaveCheckpointAsync(cp).ConfigureAwait(false);
             _stats.LastCheckpointKey = _lastEvaluatedKey;
@@ -467,19 +504,21 @@ public class BucketComparisonEngine
 
     private ScanCheckpoint CreateCheckpointSnapshot()
     {
+        UpdateElapsed();
         return new ScanCheckpoint
         {
             BucketNameA = _configA?.BucketName ?? "",
             EndpointA = _configA?.EndpointUrl ?? "",
             RegionA = _configA?.Region ?? "",
-            PrefixA = _configA?.Prefix ?? "",
+            PrefixA = _prefixA,
             BucketNameB = _configB?.BucketName ?? "",
             EndpointB = _configB?.EndpointUrl ?? "",
             RegionB = _configB?.Region ?? "",
-            PrefixB = _configB?.Prefix ?? "",
+            PrefixB = _prefixB,
             Mode = _mode,
             LastEvaluatedKey = _lastEvaluatedKey,
             LiveReportCsvPath = _liveReportCsvPath,
+            LiveReportCsvBytes = _csvStream?.Length ?? 0,
             ObjectsCompared = _stats.ObjectsCompared,
             MatchedCount = _stats.MatchedCount,
             TotalDifferences = _stats.TotalDifferences,
@@ -488,6 +527,7 @@ public class BucketComparisonEngine
             SizeMismatchCount = _stats.SizeMismatchCount,
             ETagMismatchCount = _stats.ETagMismatchCount,
             ContentMismatchCount = _stats.ContentMismatchCount,
+            ContentCheckErrorCount = _stats.ContentCheckErrorCount,
             SequenceGapCount = _stats.SequenceGapCount,
             ElapsedSeconds = _stats.ElapsedTime.TotalSeconds,
             DetectSequenceGaps = _detectSequenceGaps,
@@ -504,18 +544,24 @@ public class BucketComparisonEngine
         }
     }
 
-    private void UpdateLiveStats(IS3ObjectStream? enumA, IS3ObjectStream? enumB)
+    /// <summary>Elapsed scan time excluding time spent paused (plus time accumulated before a resume).</summary>
+    private void UpdateElapsed()
     {
-        double totalSeconds = _stopwatch.Elapsed.TotalSeconds;
+        double totalSeconds = (_stopwatch.Elapsed - _pauseWatch.Elapsed).TotalSeconds;
         if (_resumeCheckpoint != null)
         {
             totalSeconds += _resumeCheckpoint.ElapsedSeconds;
         }
         _stats.ElapsedTime = TimeSpan.FromSeconds(totalSeconds);
         _stats.ItemsPerSecond = totalSeconds > 0 ? _stats.ObjectsCompared / totalSeconds : 0;
+    }
 
-        var proc = Process.GetCurrentProcess();
-        _stats.WorkingSetMB = proc.WorkingSet64 / (1024.0 * 1024.0);
+    private void UpdateLiveStats(IS3ObjectStream? enumA, IS3ObjectStream? enumB)
+    {
+        UpdateElapsed();
+
+        // Cheap, allocation-free memory probes (Process.GetCurrentProcess() costs ~20ms and leaks a handle)
+        _stats.WorkingSetMB = Environment.WorkingSet / (1024.0 * 1024.0);
         _stats.GCTotalMemoryMB = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
 
         if (enumA != null)
@@ -530,32 +576,39 @@ public class BucketComparisonEngine
         }
     }
 
+    private ObjectDifference BuildPairDifference(S3ObjectSummary itemA, S3ObjectSummary itemB, string relativeKey, DifferenceType type, string details)
+    {
+        return new ObjectDifference
+        {
+            Id = ++_differenceIdCounter,
+            Key = DisplayKey(itemA, relativeKey),
+            Type = type,
+            Details = details,
+            BucketASize = itemA.Size,
+            BucketBSize = itemB.Size,
+            BucketAETag = itemA.ETag,
+            BucketBETag = itemB.ETag,
+            BucketALastModified = itemA.LastModified,
+            BucketBLastModified = itemB.LastModified,
+            BucketAStorageClass = itemA.StorageClass,
+            BucketBStorageClass = itemB.StorageClass
+        };
+    }
+
     private async Task CompareSameKeyAsync(
         IAmazonS3? clientA,
         IAmazonS3? clientB,
         S3ObjectSummary itemA,
         S3ObjectSummary itemB,
+        string relativeKey,
         StreamWriter? csvWriter,
         CancellationToken cancellationToken)
     {
         // 1. Check size
         if (itemA.Size != itemB.Size)
         {
-            var diff = new ObjectDifference
-            {
-                Id = ++_differenceIdCounter,
-                Key = itemA.Key,
-                Type = DifferenceType.SizeMismatch,
-                Details = $"Size mismatch: A has {itemA.FormattedSize} ({itemA.Size} B), B has {itemB.FormattedSize} ({itemB.Size} B)",
-                BucketASize = itemA.Size,
-                BucketBSize = itemB.Size,
-                BucketAETag = itemA.ETag,
-                BucketBETag = itemB.ETag,
-                BucketALastModified = itemA.LastModified,
-                BucketBLastModified = itemB.LastModified,
-                BucketAStorageClass = itemA.StorageClass,
-                BucketBStorageClass = itemB.StorageClass
-            };
+            var diff = BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.SizeMismatch,
+                $"Size mismatch: A has {itemA.FormattedSize} ({itemA.Size} B), B has {itemB.FormattedSize} ({itemB.Size} B)");
             await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
             _stats.SizeMismatchCount++;
             _stats.TotalDifferences++;
@@ -563,81 +616,101 @@ public class BucketComparisonEngine
         }
 
         // 2. Check ETags
-        bool etagsIdentical = string.Equals(itemA.ETag, itemB.ETag, StringComparison.OrdinalIgnoreCase);
-
-        if (etagsIdentical)
+        if (string.Equals(itemA.ETag, itemB.ETag, StringComparison.OrdinalIgnoreCase))
         {
             _stats.MatchedCount++;
             return;
         }
 
         // ETags differ
-        if (_mode == ComparisonMode.ListingOnly || clientA == null || clientB == null || _configA == null || _configB == null)
+        bool canDownload = ContentComparer != null
+            || (clientA != null && clientB != null && _configA != null && _configB != null);
+
+        if (_mode == ComparisonMode.ListingOnly || !canDownload)
         {
-            var diff = new ObjectDifference
-            {
-                Id = ++_differenceIdCounter,
-                Key = itemA.Key,
-                Type = DifferenceType.ETagMismatch,
-                Details = $"ETags differ (A: {itemA.ETag}, B: {itemB.ETag}). Size is identical ({itemA.FormattedSize}). Note: multipart uploads have different ETags even if content matches.",
-                BucketASize = itemA.Size,
-                BucketBSize = itemB.Size,
-                BucketAETag = itemA.ETag,
-                BucketBETag = itemB.ETag,
-                BucketALastModified = itemA.LastModified,
-                BucketBLastModified = itemB.LastModified,
-                BucketAStorageClass = itemA.StorageClass,
-                BucketBStorageClass = itemB.StorageClass
-            };
+            var diff = BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ETagMismatch,
+                $"ETags differ (A: {itemA.ETag}, B: {itemB.ETag}). Size is identical ({itemA.FormattedSize}). Note: multipart uploads have different ETags even if content matches.");
             await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
             _stats.ETagMismatchCount++;
             _stats.TotalDifferences++;
+            return;
+        }
+
+        // Full Data mode
+        bool singlePartBoth = !itemA.ETag.Contains('-') && !itemB.ETag.Contains('-');
+        if (singlePartBoth)
+        {
+            // Single-part ETags are content hashes: different hashes with equal sizes already prove different content,
+            // so no download (and no egress) is needed. (Not valid for SSE-KMS/SSE-C objects, whose ETags are not MD5.)
+            var diff = BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentMismatch,
+                $"Content mismatch: single-part ETags differ (A: {itemA.ETag}, B: {itemB.ETag}) with identical size ({itemA.FormattedSize}).");
+            await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
+            _stats.ContentMismatchCount++;
+            _stats.TotalDifferences++;
+            return;
+        }
+
+        bool contentMatches;
+        try
+        {
+            contentMatches = ContentComparer != null
+                ? await ContentComparer(itemA, itemB, cancellationToken).ConfigureAwait(false)
+                : await StreamCompareObjectsAsync(clientA!, clientB!, itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+        }
+        catch (AmazonServiceException ex)
+        {
+            // Glacier InvalidObjectState, 404 races, AccessDenied, ...: record the object and keep scanning.
+            var errDiff = BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentCheckError,
+                $"Content could not be verified: {(string.IsNullOrEmpty(ex.ErrorCode) ? ex.GetType().Name : ex.ErrorCode)}: {ex.Message}");
+            await RecordDifferenceAsync(errDiff, csvWriter).ConfigureAwait(false);
+            _stats.ContentCheckErrorCount++;
+            _stats.TotalDifferences++;
+            return;
+        }
+
+        if (contentMatches)
+        {
+            _stats.MatchedCount++;
         }
         else
         {
-            // Full Data mode: Stream read both objects in 64KB chunks
-            bool contentMatches = await StreamCompareObjectsAsync(clientA, clientB, itemA.Key, cancellationToken).ConfigureAwait(false);
-            if (contentMatches)
-            {
-                _stats.MatchedCount++;
-            }
-            else
-            {
-                var diff = new ObjectDifference
-                {
-                    Id = ++_differenceIdCounter,
-                    Key = itemA.Key,
-                    Type = DifferenceType.ContentMismatch,
-                    Details = $"Content byte mismatch! Size is identical ({itemA.FormattedSize}) but data stream differs.",
-                    BucketASize = itemA.Size,
-                    BucketBSize = itemB.Size,
-                    BucketAETag = itemA.ETag,
-                    BucketBETag = itemB.ETag,
-                    BucketALastModified = itemA.LastModified,
-                    BucketBLastModified = itemB.LastModified,
-                    BucketAStorageClass = itemA.StorageClass,
-                    BucketBStorageClass = itemB.StorageClass
-                };
-                await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
-                _stats.ContentMismatchCount++;
-                _stats.TotalDifferences++;
-            }
+            var diff = BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentMismatch,
+                $"Content byte mismatch! Size is identical ({itemA.FormattedSize}) but data stream differs.");
+            await RecordDifferenceAsync(diff, csvWriter).ConfigureAwait(false);
+            _stats.ContentMismatchCount++;
+            _stats.TotalDifferences++;
         }
     }
 
     private async Task<bool> StreamCompareObjectsAsync(
         IAmazonS3 clientA,
         IAmazonS3 clientB,
-        string key,
+        string keyA,
+        string keyB,
         CancellationToken cancellationToken)
     {
         if (_configA == null || _configB == null) return false;
 
-        var getA = new GetObjectRequest { BucketName = _configA.BucketName, Key = key };
-        var getB = new GetObjectRequest { BucketName = _configB.BucketName, Key = key };
+        var getA = new GetObjectRequest { BucketName = _configA.BucketName, Key = keyA };
+        var getB = new GetObjectRequest { BucketName = _configB.BucketName, Key = keyB };
 
-        using var respA = await clientA.GetObjectAsync(getA, cancellationToken).ConfigureAwait(false);
-        using var respB = await clientB.GetObjectAsync(getB, cancellationToken).ConfigureAwait(false);
+        // Open both streams concurrently
+        var taskA = clientA.GetObjectAsync(getA, cancellationToken);
+        var taskB = clientB.GetObjectAsync(getB, cancellationToken);
+        try
+        {
+            await Task.WhenAll(taskA, taskB).ConfigureAwait(false);
+        }
+        catch
+        {
+            // WhenAll waits for both; release whichever request did succeed
+            if (taskA.Status == TaskStatus.RanToCompletion) taskA.Result.Dispose();
+            if (taskB.Status == TaskStatus.RanToCompletion) taskB.Result.Dispose();
+            throw;
+        }
+
+        using var respA = taskA.Result;
+        using var respB = taskB.Result;
 
         await using var streamA = respA.ResponseStream;
         await using var streamB = respB.ResponseStream;
@@ -676,13 +749,11 @@ public class BucketComparisonEngine
 
     private async Task RecordDifferenceAsync(ObjectDifference diff, StreamWriter? csvWriter)
     {
-        DifferenceFound?.Invoke(diff);
+        SafeRaise(DifferenceFound, diff);
 
         if (csvWriter != null)
         {
-            string escapeCsv(string? val) => $"\"{val?.Replace("\"", "\"\"") ?? ""}\"";
-            string line = $"{diff.Id},{escapeCsv(diff.Key)},{diff.Type},{escapeCsv(diff.Details)},{diff.BucketASize?.ToString() ?? ""},{diff.BucketBSize?.ToString() ?? ""},{escapeCsv(diff.BucketAETag)},{escapeCsv(diff.BucketBETag)},{diff.BucketALastModified:O},{diff.BucketBLastModified:O},{escapeCsv(diff.BucketAStorageClass)},{escapeCsv(diff.BucketBStorageClass)},{escapeCsv(diff.MetadataSummary)},{diff.DetectedAt:O}";
-            await csvWriter.WriteLineAsync(line).ConfigureAwait(false);
+            await csvWriter.WriteLineAsync(CsvReport.BuildLine(diff)).ConfigureAwait(false);
         }
     }
 
@@ -698,6 +769,7 @@ public class BucketComparisonEngine
             SizeMismatchCount = _stats.SizeMismatchCount,
             ETagMismatchCount = _stats.ETagMismatchCount,
             ContentMismatchCount = _stats.ContentMismatchCount,
+            ContentCheckErrorCount = _stats.ContentCheckErrorCount,
             SequenceGapCount = _stats.SequenceGapCount,
             BucketAObjectsRead = _stats.BucketAObjectsRead,
             BucketBObjectsRead = _stats.BucketBObjectsRead,

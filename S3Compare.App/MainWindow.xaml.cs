@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Windows;
 using S3Compare.App.ViewModels;
 
@@ -7,10 +8,12 @@ public partial class MainWindow : Window
 {
     private bool _showSecretA = false;
     private bool _showSecretB = false;
+    private bool _closeConfirmed = false;
 
     public MainWindow()
     {
         InitializeComponent();
+        Closing += OnWindowClosing;
         Loaded += async (s, e) =>
         {
             Activate();
@@ -18,6 +21,27 @@ public partial class MainWindow : Window
             await Task.Delay(2000);
             Topmost = false;
         };
+    }
+
+    /// <summary>
+    /// A running scan must stop cleanly first so its final checkpoint and live CSV are flushed to disk.
+    /// </summary>
+    private async void OnWindowClosing(object? sender, CancelEventArgs e)
+    {
+        if (_closeConfirmed || DataContext is not MainViewModel vm || !vm.IsRunning)
+            return;
+
+        e.Cancel = true;
+        IsEnabled = false;
+        try
+        {
+            await vm.ShutdownAsync();
+        }
+        finally
+        {
+            _closeConfirmed = true;
+            Close();
+        }
     }
 
     private void TxtSecretKeyA_PasswordChanged(object sender, RoutedEventArgs e)
