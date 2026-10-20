@@ -12,6 +12,7 @@ public class DifferenceTypeToBrushConverter : IValueConverter
     private static readonly SolidColorBrush RedBrush = new(Color.FromRgb(220, 38, 38));    // Size / Content mismatch
     private static readonly SolidColorBrush PurpleBrush = new(Color.FromRgb(147, 51, 234));// ETag mismatch
     private static readonly SolidColorBrush PinkBrush = new(Color.FromRgb(219, 39, 119));  // Possible Missing On Both Sides
+    private static readonly SolidColorBrush OrangeBrush = new(Color.FromRgb(234, 88, 12)); // Content check error
     private static readonly SolidColorBrush GrayBrush = new(Color.FromRgb(107, 114, 128));
 
     static DifferenceTypeToBrushConverter()
@@ -21,6 +22,7 @@ public class DifferenceTypeToBrushConverter : IValueConverter
         RedBrush.Freeze();
         PurpleBrush.Freeze();
         PinkBrush.Freeze();
+        OrangeBrush.Freeze();
         GrayBrush.Freeze();
     }
 
@@ -36,6 +38,7 @@ public class DifferenceTypeToBrushConverter : IValueConverter
                 DifferenceType.ContentMismatch => RedBrush,
                 DifferenceType.ETagMismatch => PurpleBrush,
                 DifferenceType.PossibleMissingOnBothSides => PinkBrush,
+                DifferenceType.ContentCheckError => OrangeBrush,
                 _ => GrayBrush
             };
         }

@@ -52,6 +52,10 @@ public static class S3ClientFactory
             }
             s3Config.ServiceURL = url;
         }
+        else if (!string.IsNullOrWhiteSpace(config.Region))
+        {
+            s3Config.RegionEndpoint = RegionEndpoint.GetBySystemName(config.Region.Trim());
+        }
 
         if (!string.IsNullOrWhiteSpace(config.Region))
         {

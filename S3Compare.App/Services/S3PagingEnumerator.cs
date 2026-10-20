@@ -30,7 +30,7 @@ public class S3PagingEnumerator : IS3ObjectStream
         _s3Client = s3Client ?? throw new ArgumentNullException(nameof(s3Client));
         _bucketName = bucketName ?? throw new ArgumentNullException(nameof(bucketName));
         _prefix = prefix ?? string.Empty;
-        _startAfter = string.IsNullOrWhiteSpace(startAfter) ? null : startAfter.Trim();
+        _startAfter = string.IsNullOrEmpty(startAfter) ? null : startAfter;
         _onPageLoaded = onPageLoaded;
     }
 
@@ -41,23 +41,31 @@ public class S3PagingEnumerator : IS3ObjectStream
 
     public async Task<bool> MoveNextAsync(CancellationToken cancellationToken = default)
     {
-        if (_currentBuffer.Count > 0)
+        while (true)
         {
-            _current = _currentBuffer.Dequeue();
-            return true;
-        }
+            if (_currentBuffer.Count > 0)
+            {
+                _current = _currentBuffer.Dequeue();
+                return true;
+            }
 
-        if (!_isTruncated)
-        {
-            _current = null;
-            return false;
-        }
+            if (!_isTruncated)
+            {
+                _current = null;
+                return false;
+            }
 
-        // Fetch next page
+            await LoadNextPageAsync(cancellationToken).ConfigureAwait(false);
+            // A page with 0 objects while still truncated simply loops to fetch the next one.
+        }
+    }
+
+    private async Task LoadNextPageAsync(CancellationToken cancellationToken)
+    {
         var request = new ListObjectsV2Request
         {
             BucketName = _bucketName,
-            Prefix = string.IsNullOrWhiteSpace(_prefix) ? null : _prefix,
+            Prefix = string.IsNullOrEmpty(_prefix) ? null : _prefix,
             ContinuationToken = _continuationToken,
             StartAfter = _isFirstRequest ? _startAfter : null,
             MaxKeys = 1000
@@ -68,8 +76,14 @@ public class S3PagingEnumerator : IS3ObjectStream
         _continuationToken = response.NextContinuationToken;
         _isTruncated = response.IsTruncated ?? false;
 
-        var pageItems = new List<S3ObjectSummary>(response.S3Objects.Count);
-        foreach (var obj in response.S3Objects)
+        if (_isTruncated && string.IsNullOrEmpty(_continuationToken))
+        {
+            throw new InvalidOperationException(
+                $"S3 reported a truncated listing for bucket '{_bucketName}' but returned no continuation token; aborting to avoid re-reading the first page.");
+        }
+
+        var pageItems = new List<S3ObjectSummary>(response.S3Objects?.Count ?? 0);
+        foreach (var obj in response.S3Objects ?? [])
         {
             var summary = new S3ObjectSummary
             {
@@ -85,22 +99,14 @@ public class S3PagingEnumerator : IS3ObjectStream
             _totalBytesRead += summary.Size;
         }
 
-        _onPageLoaded?.Invoke(pageItems, _continuationToken);
-
-        if (_currentBuffer.Count > 0)
+        try
         {
-            _current = _currentBuffer.Dequeue();
-            return true;
+            _onPageLoaded?.Invoke(pageItems, _continuationToken);
         }
-
-        // If page had 0 objects but isTruncated was true, loop again
-        if (_isTruncated)
+        catch
         {
-            return await MoveNextAsync(cancellationToken).ConfigureAwait(false);
+            // A misbehaving subscriber must never abort the listing.
         }
-
-        _current = null;
-        return false;
     }
 
     public ValueTask DisposeAsync()

@@ -13,7 +13,8 @@ public enum DifferenceType
     SizeMismatch,
     ETagMismatch,
     ContentMismatch,
-    PossibleMissingOnBothSides
+    PossibleMissingOnBothSides,
+    ContentCheckError
 }
 
 public class S3EndpointPreset
@@ -50,7 +51,7 @@ public class S3ObjectSummary
         string[] suffixes = { "B", "KB", "MB", "GB", "TB", "PB" };
         int counter = 0;
         decimal number = bytes;
-        while (Math.Round(number / 1024) >= 1 && counter < suffixes.Length - 1)
+        while (number >= 1024 && counter < suffixes.Length - 1)
         {
             number /= 1024;
             counter++;
@@ -83,6 +84,7 @@ public class ObjectDifference
         DifferenceType.ETagMismatch => "ETag Mismatch",
         DifferenceType.ContentMismatch => "Content Mismatch",
         DifferenceType.PossibleMissingOnBothSides => "Possible Gap (Both Sides)",
+        DifferenceType.ContentCheckError => "Content Check Error",
         _ => Type.ToString()
     };
 
@@ -121,6 +123,7 @@ public class ComparisonStatistics
     public long ETagMismatchCount { get; set; }
     public long ContentMismatchCount { get; set; }
     public long SequenceGapCount { get; set; }
+    public long ContentCheckErrorCount { get; set; }
 
     public long BucketAObjectsRead { get; set; }
     public long BucketBObjectsRead { get; set; }
@@ -157,8 +160,12 @@ public class ScanCheckpoint
     public string PrefixB { get; set; } = string.Empty;
 
     public ComparisonMode Mode { get; set; }
+    /// <summary>Last fully processed key, relative to each bucket's own prefix (prefix stripped).</summary>
     public string LastEvaluatedKey { get; set; } = string.Empty;
     public string? LiveReportCsvPath { get; set; }
+
+    /// <summary>Length in bytes of the live CSV when this checkpoint was taken; the file is truncated to this on resume.</summary>
+    public long LiveReportCsvBytes { get; set; }
 
     public long ObjectsCompared { get; set; }
     public long MatchedCount { get; set; }
@@ -169,6 +176,7 @@ public class ScanCheckpoint
     public long ETagMismatchCount { get; set; }
     public long ContentMismatchCount { get; set; }
     public long SequenceGapCount { get; set; }
+    public long ContentCheckErrorCount { get; set; }
     public double ElapsedSeconds { get; set; }
 
     public bool DetectSequenceGaps { get; set; } = true;

@@ -47,14 +47,17 @@ public class SequenceGapDetector
         string suffix = fileName.Substring(lastMatch.Index + lastMatch.Length);
         string seriesSignature = dir + prefix + "|" + suffix;
 
-        if (seriesSignature == _currentSeriesSignature)
+        // Keys are listed in lexicographic order, which matches numeric order only while the digit width is constant
+        // (file09, file10) or the numbers are zero-padded. A change in width starts a new series, so unpadded
+        // listings such as file1, file10, file2 never produce false gaps.
+        if (seriesSignature == _currentSeriesSignature && digits.Length == _currentSeriesPadding)
         {
             if (currNumber > _currentSeriesLastNumber + 1)
             {
                 long gapCount = currNumber - (_currentSeriesLastNumber + 1);
                 if (gapCount > 0 && gapCount <= _maxGapThreshold)
                 {
-                    int padLength = Math.Max(digits.Length, _currentSeriesPadding);
+                    int padLength = digits.Length;
                     for (long missing = _currentSeriesLastNumber + 1; missing < currNumber; missing++)
                     {
                         string missingStr = missing.ToString().PadLeft(padLength, '0');
