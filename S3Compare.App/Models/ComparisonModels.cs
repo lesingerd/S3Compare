@@ -178,6 +178,12 @@ public class ScanPerformanceOptions
     public const int DefaultMaxConcurrentContentChecks = 8;
     public const int DefaultMaxDiscoveryRequests = 500;
 
+    /// <summary>
+    /// Upper bound on MaxParallelPartitions x PrefetchPages. Each listing buffers up to PrefetchPages + 2 pages of 1,000
+    /// object summaries, two listings per partition, so this keeps buffered summaries around two million at most.
+    /// </summary>
+    public const int MaxBufferedPagesPerBucket = 512;
+
     /// <summary>Key ranges compared concurrently. 1 = a single range (still prefetching).</summary>
     public int MaxParallelPartitions { get; set; } = DefaultMaxParallelPartitions;
 
@@ -212,6 +218,10 @@ public class ScanPerformanceOptions
         Check(errors, nameof(MaxObjectsPerSecond), MaxObjectsPerSecond, 0, 100_000_000);
         Check(errors, nameof(MaxConcurrentContentChecks), MaxConcurrentContentChecks, 1, 256);
         Check(errors, nameof(MaxDiscoveryRequests), MaxDiscoveryRequests, 0, 100_000);
+        if (MaxParallelPartitions >= 1 && PrefetchPages >= 1 && (long)MaxParallelPartitions * PrefetchPages > MaxBufferedPagesPerBucket)
+        {
+            errors.Add($"{nameof(MaxParallelPartitions)} x {nameof(PrefetchPages)} must be at most {MaxBufferedPagesPerBucket:N0} to bound memory (was {MaxParallelPartitions:N0} x {PrefetchPages:N0} = {(long)MaxParallelPartitions * PrefetchPages:N0}).");
+        }
         return errors;
     }
 

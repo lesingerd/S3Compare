@@ -46,14 +46,14 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
   - If $\text{Key}_A == \text{Key}_B$: verifies size, ETag hash, and modification timestamps.
   - If $\text{Key}_A < \text{Key}_B$: flags $\text{Key}_A$ as **Missing in Bucket B** and advances Stream A.
   - If $\text{Key}_A > \text{Key}_B$: flags $\text{Key}_B$ as **Missing in Bucket A** and advances Stream B.
-- System working set remains low (~80–140 MB) whether scanning 1,000 or 300,000,000 files: memory is bounded by the pages in flight (about `MaxParallelPartitions × 2 buckets × (PrefetchPages + 2) × 1,000` object summaries), not by bucket size.
+- System working set remains low (~80–140 MB) whether scanning 1,000 or 300,000,000 files: memory is bounded by the pages in flight (about `MaxParallelPartitions × 2 buckets × (PrefetchPages + 2) × 1,000` object summaries), not by bucket size. Validation caps `MaxParallelPartitions × PrefetchPages` at 512, so even the largest allowed settings stay around a million summaries per bucket (on the order of 1 GB in total); the defaults stay around 32,000 per bucket.
 
 ### 2. Resumable Scans via Checkpoints (Zero Credentials Saved)
 - Scans are automatically and atomically saved to `logs/checkpoints/` about every 5 seconds and whenever you stop the scan or it fails.
 - **Strict Zero-Credential Persistence**: Checkpoints record only bucket names, endpoints, prefixes, comparison mode, running counts, and the **partition plan** (each key range's bounds, its last completed key and whether it is done). **No secret keys, access keys, passwords, or authentication headers are ever written to disk.**
 - When re-entering a bucket configuration, an alert banner detects unfinished scans and lets you click **"Resume Scan"**: the saved plan is reused, completed ranges are skipped and every other range passes `StartAfter` to S3's `ListObjectsV2` API from its own last completed key—skipping millions of already verified objects instantly.
 - **Consistent with the live CSV**: a range's progress is only saved together with the CSV length that contains every difference up to it; on resume the CSV is truncated to that length, so a stop/resume never duplicates or loses rows.
-- Checkpoints from earlier versions (a single `LastEvaluatedKey`) resume as one range.
+- Checkpoints from earlier versions (a single `LastEvaluatedKey`) are re-planned: the keyspace after that key is split into ranges (the first starts right after it), so the rest of the scan still runs in parallel.
 
 ### 3. Synthetic Sequence Gap Detection (Missing on Both Sides)
 - Identifies files potentially missing in *both* buckets based on numerical sequencing patterns (e.g., `file_01`, `file_02`, `file_04` detected $\rightarrow$ flags `file_03` as missing).
@@ -101,17 +101,17 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
 
 1. **Prefetch + concurrent A/B**: each listing runs on a background producer that requests page N+1 as soon as page N arrives, into a bounded buffer of `PrefetchPages` pages. Bucket A and Bucket B are listed at the same time, so a page costs one round trip instead of latency(A) + latency(B).
 2. **Key-range partitioning**: S3 lists keys in UTF-8 byte order, so the keyspace (relative to each bucket's own prefix) is split into ranges `(lower, upper]` that are compared by independent merge-joins. Each range lists both buckets with `StartAfter = prefix + lower` and stops after `upper`.
-   - **Planning** (before the scan, at most `MaxDiscoveryRequests` LIST calls): `Delimiter="/"` listings on both buckets, descending up to 3 folder levels, collect folder names as candidate boundaries. Flat namespaces fall back to `MaxKeys=1` probes at each printable ASCII first character (then two-character probes) to sample real keys; probes are issued coarse to fine (spread over the whole character range first) and the remaining budget is split between the buckets, so a small budget still covers the whole keyspace. About `MaxParallelPartitions × 4` evenly spaced boundaries are chosen; workers pull ranges from a queue so uneven ranges balance out.
+   - **Planning** (before the scan, at most `MaxDiscoveryRequests` LIST calls): `Delimiter="/"` listings on both buckets, descending up to 3 folder levels, collect folder names as candidate boundaries. Flat namespaces fall back to rounds of `MaxKeys=1` probes that sample real keys: the first round probes each printable ASCII first character, and every later round probes one character deeper under each populated prefix found so far. Keys with a long shared prefix and no `/` (`file_00001.dat`, `IMG_0001.jpg`, `logs-2024-…`) are descended until they branch, with no depth cap; a prefix with a single child costs only a few probes because probes whose answer is already known are not sent. Probes are issued coarse to fine (spread over the whole character range first) and the remaining budget is split between the buckets, so a small budget still covers the whole keyspace. About `MaxParallelPartitions × 4` evenly spaced boundaries are chosen; workers pull ranges from a queue so uneven ranges balance out.
    - The ranges always tile the keyspace exactly, so **planning quality only affects speed, never results**: a partitioned scan reports exactly the same differences and counts as a single-stream scan.
 
-All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles.
+All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles. Pausing also holds planning between requests.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `MaxParallelPartitions` | 8 | Key ranges compared concurrently (1–256). `1` = one range, still prefetching. |
-| `PrefetchPages` | 2 | Pages buffered ahead per listing (1–64). |
+| `PrefetchPages` | 2 | Pages buffered ahead per listing (1–64). `MaxParallelPartitions × PrefetchPages` must be at most 512, which bounds memory. |
 | `MaxListRequestsPerSecond` | 20 | Requests per second **per bucket**, shared by all partitions (token bucket, 1 s burst). Also covers planning and Full Data downloads. `0` = unlimited. |
-| `MaxObjectsPerSecond` | 0 | Aggregate cap on objects compared per second (token bucket, consumed in batches). `0` = unlimited. |
+| `MaxObjectsPerSecond` | 0 | Aggregate cap on keys compared per second (token bucket, consumed in batches). One token per key: a key present in both buckets costs 1, as does a key present in only one. `0` = unlimited. |
 | `MaxConcurrentContentChecks` | 8 | Full Data mode: object pairs downloaded at the same time across all partitions (1–256). |
 | `MaxDiscoveryRequests` | 500 | LIST budget for partition planning, both buckets together (0–100,000). `0` = no planning (one range). |
 
@@ -165,7 +165,7 @@ dotnet run --project S3Compare.App/S3Compare.App.csproj
 ```powershell
 dotnet test
 ```
-*Runs all 83 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
+*Runs all 89 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
 
 ### Publish Standalone Executable
 ```powershell

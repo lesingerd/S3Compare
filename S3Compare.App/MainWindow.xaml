@@ -691,7 +691,7 @@
 
                                 <TextBlock Text="Prefetch pages:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
                                 <TextBox Text="{Binding PrefetchPages, UpdateSourceTrigger=PropertyChanged}"
-                                         ToolTip="PrefetchPages (default 2, 1-64): 1000-key pages listed ahead of the comparison per bucket and partition. The next page is requested as soon as the previous one arrives."/>
+                                         ToolTip="PrefetchPages (default 2, 1-64): 1000-key pages listed ahead of the comparison per bucket and partition. The next page is requested as soon as the previous one arrives. Partitions x prefetch pages must be at most 512 (bounds memory)."/>
 
                                 <TextBlock Text="Max LIST req/s per bucket:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
                                 <TextBox Text="{Binding MaxListRequestsPerSecond, UpdateSourceTrigger=PropertyChanged}"
@@ -699,7 +699,7 @@
 
                                 <TextBlock Text="Max objects/s:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
                                 <TextBox Text="{Binding MaxObjectsPerSecond, UpdateSourceTrigger=PropertyChanged}"
-                                         ToolTip="MaxObjectsPerSecond (default 0 = unlimited): cap on objects compared per second across all partitions."/>
+                                         ToolTip="MaxObjectsPerSecond (default 0 = unlimited): cap on keys compared per second across all partitions. A key found in both buckets counts once."/>
 
                                 <TextBlock Text="Content checks:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
                                 <TextBox Text="{Binding MaxConcurrentContentChecks, UpdateSourceTrigger=PropertyChanged}"

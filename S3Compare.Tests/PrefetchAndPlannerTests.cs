@@ -407,6 +407,9 @@ public class PartitionPlannerTests
         Assert.Empty(new ScanPerformanceOptions().Validate());
         var bad = new ScanPerformanceOptions { MaxParallelPartitions = 0, PrefetchPages = 0, MaxListRequestsPerSecond = -1, MaxObjectsPerSecond = -5, MaxConcurrentContentChecks = 0, MaxDiscoveryRequests = -1 };
         Assert.Equal(6, bad.Validate().Count);
+        Assert.Empty(new ScanPerformanceOptions { MaxParallelPartitions = 128, PrefetchPages = 4 }.Validate());
+        var tooMuchMemory = Assert.Single(new ScanPerformanceOptions { MaxParallelPartitions = 256, PrefetchPages = 4 }.Validate());
+        Assert.Contains("MaxParallelPartitions x PrefetchPages", tooMuchMemory);
         Assert.Equal(32, new ScanPerformanceOptions().TargetPartitions);
         Assert.Equal(24, new ScanPerformanceOptions().RequiredConnectionsPerServer);
     }
