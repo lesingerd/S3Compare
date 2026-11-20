@@ -52,7 +52,11 @@ public class PrefetchingObjectStreamTests
         await using var stream = new PrefetchingObjectStream(lister, "b", "", prefetchPages: 2, pageSize: 10);
 
         Assert.True(await stream.MoveNextAsync());
-        await Task.Delay(400);
+
+        // Wait (generously, for slow agents) until the producer has run ahead, then check it stopped there
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (lister.CallCount < 3 && DateTime.UtcNow < deadline) await Task.Delay(10);
+        await Task.Delay(300);
 
         // Page 1 consumed, 2 buffered, and one more fetched and waiting for room in the channel
         Assert.InRange(lister.CallCount, 3, 4);
@@ -250,6 +254,39 @@ public class PartitionPlannerTests
 
         Assert.True(lister.CallCount <= 5);
         AssertTilesAndCovers(ranges, keys);
+    }
+
+    [Fact]
+    public async Task SmallBudget_StillSpreadsProbesAcrossTheWholeCharacterRange()
+    {
+        // Flat lowercase keys: with an in-order probe sweep a small budget would stop around the middle of the
+        // alphabet and leave everything after it in one huge range
+        var rnd = new Random(3);
+        var keys = Enumerable.Range(0, 5000)
+            .Select(_ => new string(Enumerable.Range(0, 8).Select(_ => (char)('a' + rnd.Next(26))).ToArray()))
+            .Distinct().ToList();
+        var lister = new FakeS3Lister().SetBucket("a", keys.Select(Obj)).SetBucket("b", keys.Select(Obj));
+
+        var ranges = await PartitionPlanner.PlanAsync(new PlannerBucket(lister, "a", ""), new PlannerBucket(lister, "b", ""), 32, 30);
+
+        Assert.True(lister.CallCount <= 30);
+        AssertTilesAndCovers(ranges, keys);
+        Assert.Contains(ranges, r => r.Upper != null && r.Upper[0] >= 'u');
+        Assert.Contains(ranges, r => r.Upper != null && r.Upper[0] <= 'f');
+        // Both buckets got a share of the probe budget
+        Assert.Contains(lister.Calls, c => c.Bucket == "a" && c.MaxKeys == 1);
+        Assert.Contains(lister.Calls, c => c.Bucket == "b" && c.MaxKeys == 1);
+    }
+
+    [Fact]
+    public void CoarseToFine_IsAPermutationThatSpreadsEarlyItems()
+    {
+        var items = Enumerable.Range(0, 95).ToList();
+        var order = PartitionPlanner.CoarseToFine(items).ToList();
+
+        Assert.Equal(items, order.OrderBy(i => i));
+        Assert.Equal(new[] { 0, 64, 32, 16, 48, 80 }, order.Take(6));
+        Assert.Empty(PartitionPlanner.CoarseToFine(Array.Empty<int>()));
     }
 
     [Fact]
