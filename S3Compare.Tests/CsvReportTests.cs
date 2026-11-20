@@ -90,4 +90,31 @@ public class CsvReportTests
                 if (File.Exists(p)) File.Delete(p);
         }
     }
+
+    [Fact]
+    public async Task ExportFromSessionCsv_SortsBoundedReports_AndCopiesLargeOnesInDiscoveryOrder()
+    {
+        string session = Path.Combine(Path.GetTempPath(), "S3CompareTests_" + Guid.NewGuid().ToString("N") + ".csv");
+        string export = session + ".export.csv";
+        try
+        {
+            // Out of key order, as a parallel scan writes them
+            var keys = new[] { "m/2", "a/1", "z/9", "\U0001F600", "！", "b/0" };
+            var diffs = keys.Select((k, i) => new ObjectDifference { Id = i + 1, Key = k, Type = DifferenceType.MissingInBucketB, Details = "d" }).ToList();
+            await ReportExporter.ExportToCsvAsync(session, diffs, new ComparisonStatistics());
+
+            Assert.True(await ReportExporter.ExportFromSessionCsvAsync(export, session, new ComparisonStatistics()));
+            Assert.Equal(keys.OrderBy(k => k, Utf8KeyComparer.Instance), CsvReport.ReadDifferences(export).Select(d => d.Key));
+            Assert.Contains("sorted by key", await File.ReadAllTextAsync(export + ".summary.txt"));
+
+            Assert.False(await ReportExporter.ExportFromSessionCsvAsync(export, session, new ComparisonStatistics(), maxSortedRows: 3));
+            Assert.Equal(keys, CsvReport.ReadDifferences(export).Select(d => d.Key));
+            Assert.Contains("discovery order", await File.ReadAllTextAsync(export + ".summary.txt"));
+        }
+        finally
+        {
+            foreach (var p in new[] { session, session + ".summary.txt", export, export + ".summary.txt" })
+                if (File.Exists(p)) File.Delete(p);
+        }
+    }
 }
