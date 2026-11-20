@@ -8,7 +8,7 @@
 
 A high-performance, dark-themed Windows desktop application built with **.NET 9** and **WPF** for comparing multi-terabyte and petabyte-scale S3-compatible object buckets (tailored for **Wasabi** and fully compatible with **AWS S3**, **MinIO**, **Ceph**, and **Cloudflare R2**).
 
-Designed from the ground up for massive datasets (~300M+ objects), S3Compare uses a **two-way streaming merge diff** with $O(1)$ memory consumption, resilient atomic checkpointing, synthetic sequence gap detection, live CSV reporting, and a responsive, collapsible UI optimized for high-DPI displays and remote desktop sessions.
+Designed from the ground up for massive datasets (~300M+ objects), S3Compare uses a **two-way streaming merge diff** with $O(1)$ memory consumption, **parallel key-range partitioning with page prefetch**, resilient atomic checkpointing, synthetic sequence gap detection, live CSV reporting, and a responsive, collapsible UI optimized for high-DPI displays and remote desktop sessions.
 
 ---
 
@@ -41,21 +41,24 @@ Designed from the ground up for massive datasets (~300M+ objects), S3Compare use
 Comparing hundreds of terabytes or tens of millions of objects cannot load entire indexes into system memory. 
 - S3's `ListObjectsV2` API guarantees lexicographical (UTF-8 binary) ordering for object keys.
 - **S3Compare** runs a streaming **two-way merge diff** algorithm:
-  - Concurrently pages 1,000 objects at a time via `ContinuationToken` from both Bucket A and Bucket B.
+  - Pages 1,000 objects at a time via `ContinuationToken` from both Bucket A and Bucket B, listing both buckets concurrently and prefetching the next pages in the background (see [High-Throughput Parallel Scanning](#9-high-throughput-parallel-scanning)).
   - Compares the active head keys in $O(1)$ constant memory without in-memory buffering.
   - If $\text{Key}_A == \text{Key}_B$: verifies size, ETag hash, and modification timestamps.
   - If $\text{Key}_A < \text{Key}_B$: flags $\text{Key}_A$ as **Missing in Bucket B** and advances Stream A.
   - If $\text{Key}_A > \text{Key}_B$: flags $\text{Key}_B$ as **Missing in Bucket A** and advances Stream B.
-- System working set remains low (~80–140 MB) whether scanning 1,000 or 300,000,000 files.
+- System working set remains low (~80–140 MB) whether scanning 1,000 or 300,000,000 files: memory is bounded by the pages in flight (about `MaxParallelPartitions × 2 buckets × (PrefetchPages + 2) × 1,000` object summaries), not by bucket size.
 
 ### 2. Resumable Scans via Checkpoints (Zero Credentials Saved)
-- Scans are automatically and atomically saved to `logs/checkpoints/` every 5,000 objects and whenever you pause or cancel.
-- **Strict Zero-Credential Persistence**: Checkpoints record only bucket names, endpoints, prefixes, comparison mode, running counts, and the `LastEvaluatedKey`. **No secret keys, access keys, passwords, or authentication headers are ever written to disk.**
-- When re-entering a bucket configuration, an alert banner detects unfinished scans and lets you click **"Resume Scan"** to pass `StartAfter` to S3's `ListObjectsV2` API—skipping millions of already verified objects instantly.
+- Scans are automatically and atomically saved to `logs/checkpoints/` about every 5 seconds and whenever you stop the scan or it fails.
+- **Strict Zero-Credential Persistence**: Checkpoints record only bucket names, endpoints, prefixes, comparison mode, running counts, and the **partition plan** (each key range's bounds, its last completed key and whether it is done). **No secret keys, access keys, passwords, or authentication headers are ever written to disk.**
+- When re-entering a bucket configuration, an alert banner detects unfinished scans and lets you click **"Resume Scan"**: the saved plan is reused, completed ranges are skipped and every other range passes `StartAfter` to S3's `ListObjectsV2` API from its own last completed key—skipping millions of already verified objects instantly.
+- **Consistent with the live CSV**: a range's progress is only saved together with the CSV length that contains every difference up to it; on resume the CSV is truncated to that length, so a stop/resume never duplicates or loses rows.
+- Checkpoints from earlier versions (a single `LastEvaluatedKey`) resume as one range.
 
 ### 3. Synthetic Sequence Gap Detection (Missing on Both Sides)
 - Identifies files potentially missing in *both* buckets based on numerical sequencing patterns (e.g., `file_01`, `file_02`, `file_04` detected $\rightarrow$ flags `file_03` as missing).
 - Operates in $O(1)$ streaming time across directory paths and filename patterns.
+- Each key-range partition has its own detector, so a gap that straddles a partition boundary (or a resume point) is not reported. Set `MaxParallelPartitions` to 1 if you rely on gap detection across a whole listing.
 - Configurable **Max Gap Threshold** (default: 25) prevents false alarms from intentional non-sequential numbers.
 - Tagged with **Missing on Both Sides (Gap)** in pink (`#EC4899`) on dashboard cards and discrepancy reports.
 
@@ -90,7 +93,38 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
 
 ### 8. Enterprise Security & Zero Persistence
 - **100% Read-Only**: Performs exclusively `ListObjectsV2` and streaming read-only `GetObject` operations. Never executes `PutObject`, `DeleteObject`, `CopyObject`, or ACL mutations.
-- **In-Memory Only**: Credentials exist solely in volatile memory during the active session. Nothing is written to the Windows Registry, configuration files, or temporary directories.
+- **In-Memory Only**: Credentials exist solely in volatile memory during the active session. Nothing is written to the Windows Registry, configuration files, or temporary directories. (For the same reason, Performance / Throttling settings are not remembered between sessions; they start at their defaults.)
+
+### 9. High-Throughput Parallel Scanning
+`ListObjectsV2` pages of one listing are strictly sequential (each needs the previous page's opaque continuation token), so a single listing can never go faster than 1,000 keys per round trip. S3Compare removes that ceiling in two ways:
+
+1. **Prefetch + concurrent A/B**: each listing runs on a background producer that requests page N+1 as soon as page N arrives, into a bounded buffer of `PrefetchPages` pages. Bucket A and Bucket B are listed at the same time, so a page costs one round trip instead of latency(A) + latency(B).
+2. **Key-range partitioning**: S3 lists keys in UTF-8 byte order, so the keyspace (relative to each bucket's own prefix) is split into ranges `(lower, upper]` that are compared by independent merge-joins. Each range lists both buckets with `StartAfter = prefix + lower` and stops after `upper`.
+   - **Planning** (before the scan, at most `MaxDiscoveryRequests` LIST calls): `Delimiter="/"` listings on both buckets, descending up to 3 folder levels, collect folder names as candidate boundaries. Flat namespaces fall back to `MaxKeys=1` probes at each printable ASCII first character (then two-character probes) to sample real keys. About `MaxParallelPartitions × 4` evenly spaced boundaries are chosen; workers pull ranges from a queue so uneven ranges balance out.
+   - The ranges always tile the keyspace exactly, so **planning quality only affects speed, never results**: a partitioned scan reports exactly the same differences and counts as a single-stream scan.
+
+All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `MaxParallelPartitions` | 8 | Key ranges compared concurrently (1–256). `1` = one range, still prefetching. |
+| `PrefetchPages` | 2 | Pages buffered ahead per listing (1–64). |
+| `MaxListRequestsPerSecond` | 20 | Requests per second **per bucket**, shared by all partitions (token bucket, 1 s burst). Also covers planning and Full Data downloads. `0` = unlimited. |
+| `MaxObjectsPerSecond` | 0 | Aggregate cap on objects compared per second (token bucket, consumed in batches). `0` = unlimited. |
+| `MaxConcurrentContentChecks` | 8 | Full Data mode: object pairs downloaded at the same time across all partitions (1–256). |
+| `MaxDiscoveryRequests` | 500 | LIST budget for partition planning, both buckets together (0–100,000). `0` = no planning (one range). |
+
+Set them in the collapsible **🚀 Performance / Throttling** section under the options bar (each field has a tooltip). They are validated when you start a scan. They do not affect correctness, so a checkpoint can be resumed with different values (the saved partition plan is reused). The setting names are identical in the sister project S3CompareService.
+
+**Sizing.** Throughput is roughly
+
+> objects/s ≈ `MaxParallelPartitions` × 1,000 / page latency (s), capped at `MaxListRequestsPerSecond` × 1,000 per bucket
+
+For example, at 100 ms per LIST page, 8 partitions give ~80,000 objects/s, but the default 20 requests/s cap holds that to ~20,000 objects/s (~4 hours for 300M objects). Raising the cap to 100 and partitions to 16 allows ~100,000 objects/s if the endpoint keeps up. Each S3 client is configured with `MaxConnectionsPerServer ≥ 2 × partitions + content checks`. Watch for `SlowDown`/503 responses in the diagnostics log and lower the request cap if they appear.
+
+**Request cost.** A full scan issues about one LIST per 1,000 objects per bucket, plus up to `MaxDiscoveryRequests` for planning: ~300,000 LIST requests per bucket for 300M objects. On AWS S3 Standard, LIST requests are billed (on the order of USD 0.005 per 1,000 at the time of writing, i.e. ~USD 1.50 per bucket for 300M objects); Wasabi does not charge per API request. Parallelism changes how fast the requests are made, not how many.
+
+**Report order.** Differences are found out of key order, so the live CSV is in discovery order. Exported reports (CSV and JSON) of up to 200,000 rows are sorted by key; larger reports keep discovery order (sort them in a database or spreadsheet). The summary sidecar says which order applies.
 
 ---
 
@@ -130,7 +164,7 @@ dotnet run --project S3Compare.App/S3Compare.App.csproj
 ```powershell
 dotnet test
 ```
-*Runs all 18 automated xUnit tests validating the streaming two-way merge diff, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, and WPF window instantiation.*
+*Runs all 72 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
 
 ### Publish Standalone Executable
 ```powershell
@@ -148,20 +182,26 @@ S3Compare/
 │   ├── Converters/                     # Value converters (DifferenceType to Brush, InverseBoolean)
 │   ├── Models/                         # Comparison models, checkpoints, and statistics
 │   ├── Services/
-│   │   ├── BucketComparisonEngine.cs   # Two-way streaming merge diff engine
+│   │   ├── BucketComparisonEngine.cs   # Partitioned two-way streaming merge diff engine
 │   │   ├── CheckpointManager.cs        # Atomic checkpoint save/resume manager
+│   │   ├── IS3Lister.cs                # ListObjectsV2 abstraction (+ AmazonS3Lister)
 │   │   ├── IS3ObjectStream.cs          # Streaming interface abstraction
+│   │   ├── PartitionPlanner.cs         # Splits the keyspace into key ranges
+│   │   ├── PrefetchingObjectStream.cs  # Background-prefetching paged listing of a key range
 │   │   ├── ReportExporter.cs           # CSV and JSON report exporter
 │   │   ├── S3ClientFactory.cs          # S3/Wasabi client factory and presets
-│   │   ├── S3PagingEnumerator.cs       # Paged S3 enumerator using ContinuationToken
 │   │   ├── ScanDiagnosticsLogger.cs    # Async memory, GC, and rate heartbeat logger
-│   │   └── SequenceGapDetector.cs      # O(1) streaming numerical sequence gap detector
+│   │   ├── SequenceGapDetector.cs      # O(1) streaming numerical sequence gap detector
+│   │   └── TokenBucketRateLimiter.cs   # Request / object rate limits
 │   ├── ViewModels/                     # MVVM ViewModel with throttled UI dispatching
 │   ├── MainWindow.xaml                 # Responsive, collapsible dark-theme WPF UI
 │   ├── icon.ico                        # Multi-resolution embedded application icon
 │   └── icon.png                        # Application icon source asset
 ├── S3Compare.Tests/                    # Automated xUnit Test Suite
+│   ├── FakeS3Lister.cs                 # In-memory ListObjectsV2 with latency/fault injection
 │   ├── MainWindowTests.cs              # UI and window instantiation tests
+│   ├── ParallelEngineTests.cs          # Partitioned engine equivalence, resume, throttling
+│   ├── PrefetchAndPlannerTests.cs      # Prefetch stream, rate limiter, partition planner
 │   └── StreamingComparisonTests.cs     # Gap detection, checkpoint, and comparison tests
 ├── Screenshot1.png                     # Full UI screenshot
 ├── Screenshot2.png                     # Collapsed configuration screenshot
