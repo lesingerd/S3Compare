@@ -106,6 +106,9 @@ public class BucketComparisonEngine
     /// <summary>MaxKeys for range listings (S3 caps it at 1000). Intended for tests.</summary>
     public int ListPageSize { get; set; } = PrefetchingObjectStream.DefaultPageSize;
 
+    /// <summary>Test hook: runs on the writer before each commit batch (1-based number); throwing simulates a disk failure.</summary>
+    internal Action<int>? BeforeWriterBatch { get; set; }
+
     /// <summary>The partition plan of the current (or last) run, with progress. Snapshot copy.</summary>
     public IReadOnlyList<ScanPartition> CurrentPlan => _ranges.Select(r => r.Clone()).ToList();
 
@@ -211,10 +214,17 @@ public class BucketComparisonEngine
             : key;
     }
 
-    /// <summary>Builds the S3 StartAfter value for a bucket from a relative key.</summary>
+    /// <summary>
+    /// Builds the S3 StartAfter value for a bucket from a relative key; null means "from the start of the prefix".
+    /// An empty relative key is a real key (the folder marker object whose key equals the prefix), so it yields
+    /// StartAfter = prefix, which excludes that marker. With no prefix an empty key cannot exist (S3 keys are never
+    /// empty), so nothing needs skipping and null is returned.
+    /// </summary>
     public static string? BuildStartAfter(string prefix, string? relativeKey)
     {
-        return string.IsNullOrEmpty(relativeKey) ? null : (prefix ?? string.Empty) + relativeKey;
+        if (relativeKey == null) return null;
+        string startAfter = (prefix ?? string.Empty) + relativeKey;
+        return startAfter.Length == 0 ? null : startAfter;
     }
 
     private void InitializeFromCheckpoint(ScanCheckpoint cp)
@@ -336,11 +346,13 @@ public class BucketComparisonEngine
             {
                 workers[w] = Task.Run(async () =>
                 {
+                    // Object-rate tokens are owed per worker, across ranges, so many small ranges are still throttled
+                    var objectTokens = new ObjectTokenAccount();
                     while (pending.TryDequeue(out int index))
                     {
                         try
                         {
-                            await ProcessRangeAsync(index, plan[index], listerA, listerB, commitChannel.Writer, scanCts.Token).ConfigureAwait(false);
+                            await ProcessRangeAsync(index, plan[index], listerA, listerB, commitChannel.Writer, objectTokens, scanCts.Token).ConfigureAwait(false);
                         }
                         catch (Exception ex) when (ex is not OperationCanceledException || !scanCts.IsCancellationRequested)
                         {
@@ -349,6 +361,13 @@ public class BucketComparisonEngine
                             try { scanCts.Cancel(); } catch (ObjectDisposedException) { }
                             return;
                         }
+                    }
+
+                    // Charge what is left below a full batch
+                    if (_objectLimiter != null && objectTokens.Owed > 0)
+                    {
+                        await _objectLimiter.WaitAsync(objectTokens.Owed, scanCts.Token).ConfigureAwait(false);
+                        objectTokens.Owed = 0;
                     }
                 });
             }
@@ -366,9 +385,10 @@ public class BucketComparisonEngine
             await writerTask.ConfigureAwait(false);
             writerTask = null;
 
+            // A stop requested by the caller wins: errors raised while workers were being torn down are side effects of it
+            cancellationToken.ThrowIfCancellationRequested();
             if (_writerError != null) ExceptionDispatchInfo.Capture(_writerError).Throw();
             if (firstError != null) ExceptionDispatchInfo.Capture(firstError).Throw();
-            cancellationToken.ThrowIfCancellationRequested();
 
             _phase = "Completed";
             if (CanCheckpoint)
@@ -380,6 +400,11 @@ public class BucketComparisonEngine
                 await diagnosticsLogger.LogInfoAsync($"Scan completed successfully. Total objects: {_totals.ObjectsCompared:N0}, Matched: {_totals.MatchedCount:N0}, Differences: {_totals.TotalDifferences:N0}").ConfigureAwait(false);
             }
             completed = true;
+        }
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested && ex is not OperationCanceledException)
+        {
+            // E.g. planning failed because its requests were aborted by the stop: report a stop, not a failure
+            throw new OperationCanceledException("The scan was stopped.", ex, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -572,6 +597,7 @@ public class BucketComparisonEngine
         IS3Lister? listerA,
         IS3Lister? listerB,
         ChannelWriter<CommitBatch> commits,
+        ObjectTokenAccount objectTokens,
         CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _activePartitions);
@@ -583,6 +609,12 @@ public class BucketComparisonEngine
         {
             (enumA, enumB) = CreateStreams(range, listerA, listerB, cancellationToken);
             var gapDetector = _detectSequenceGaps ? new SequenceGapDetector(_maxSequenceGapThreshold) : null;
+            if (gapDetector != null && range.LastCompletedKey != null)
+            {
+                // A resumed range continues the numeric series of the key it stopped after, as an uninterrupted run would
+                long unusedIds = 0;
+                gapDetector.CheckKey(range.LastCompletedKey, ref unusedIds);
+            }
 
             bool hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
             bool hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
@@ -658,10 +690,11 @@ public class BucketComparisonEngine
                     await CommitAsync(work, commits, completed: false, cancellationToken).ConfigureAwait(false);
                 }
 
-                if (_objectLimiter != null && ++work.SinceObjectTokens >= _objectBatch)
+                if (_objectLimiter != null && ++objectTokens.Owed >= _objectBatch)
                 {
-                    work.SinceObjectTokens = 0;
-                    await _objectLimiter.WaitAsync(_objectBatch, cancellationToken).ConfigureAwait(false);
+                    int owed = objectTokens.Owed;
+                    objectTokens.Owed = 0;
+                    await _objectLimiter.WaitAsync(owed, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -767,8 +800,11 @@ public class BucketComparisonEngine
     {
         try
         {
+            int batchNumber = 0;
             await foreach (var batch in commits.Reader.ReadAllAsync().ConfigureAwait(false))
             {
+                BeforeWriterBatch?.Invoke(++batchNumber);
+
                 if (batch.Differences != null)
                 {
                     foreach (var diff in batch.Differences)
@@ -973,22 +1009,34 @@ public class BucketComparisonEngine
         await _contentChecks.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // Downloads count against each bucket's request budget
-            await _limiterA.WaitIfLimitedAsync(1, cancellationToken).ConfigureAwait(false);
-            await _limiterB.WaitIfLimitedAsync(1, cancellationToken).ConfigureAwait(false);
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    // Downloads count against each bucket's request budget
+                    await _limiterA.WaitIfLimitedAsync(1, cancellationToken).ConfigureAwait(false);
+                    await _limiterB.WaitIfLimitedAsync(1, cancellationToken).ConfigureAwait(false);
 
-            contentMatches = ContentComparer != null
-                ? await ContentComparer(itemA, itemB, cancellationToken).ConfigureAwait(false)
-                : await StreamCompareObjectsAsync(_clientA!, _clientB!, itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
-        }
-        catch (AmazonServiceException ex)
-        {
-            // Glacier InvalidObjectState, 404 races, AccessDenied, ...: record the object and keep scanning.
-            work.KeyDiffs.Add(BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentCheckError,
-                $"Content could not be verified: {(string.IsNullOrEmpty(ex.ErrorCode) ? ex.GetType().Name : ex.ErrorCode)}: {ex.Message}"));
-            work.KeyCounters.ContentCheckErrorCount++;
-            work.KeyCounters.TotalDifferences++;
-            return;
+                    contentMatches = ContentComparer != null
+                        ? await ContentComparer(itemA, itemB, cancellationToken).ConfigureAwait(false)
+                        : await StreamCompareObjectsAsync(_clientA!, _clientB!, itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+                    break;
+                }
+                catch (Exception ex) when (IsPerObjectContentFailure(ex, cancellationToken))
+                {
+                    // Transport failures (reset connection, timeout, ...) get one more try; service errors are definitive
+                    if (attempt < ContentCheckAttempts && ex is not AmazonServiceException) continue;
+
+                    // Glacier InvalidObjectState, 404 races, AccessDenied, network failures...: record the object and keep scanning.
+                    string reason = ex is AmazonServiceException svc && !string.IsNullOrEmpty(svc.ErrorCode) ? svc.ErrorCode : ex.GetType().Name;
+                    string attempts = attempt > 1 ? $" (after {attempt} attempts)" : "";
+                    work.KeyDiffs.Add(BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentCheckError,
+                        $"Content could not be verified{attempts}: {reason}: {ex.Message}"));
+                    work.KeyCounters.ContentCheckErrorCount++;
+                    work.KeyCounters.TotalDifferences++;
+                    return;
+                }
+            }
         }
         finally
         {
@@ -1007,6 +1055,19 @@ public class BucketComparisonEngine
             work.KeyCounters.TotalDifferences++;
         }
     }
+
+    private const int ContentCheckAttempts = 2;
+
+    /// <summary>
+    /// Failures that concern one object pair and must not abort the scan. A cancellation counts only when it is not the
+    /// scan being stopped (e.g. an HTTP timeout surfacing as TaskCanceledException).
+    /// </summary>
+    private static bool IsPerObjectContentFailure(Exception ex, CancellationToken scanToken) => ex switch
+    {
+        OperationCanceledException => !scanToken.IsCancellationRequested,
+        AmazonServiceException or AmazonClientException or IOException or System.Net.Http.HttpRequestException => true,
+        _ => false
+    };
 
     private async Task<bool> StreamCompareObjectsAsync(
         IAmazonS3 clientA,
@@ -1191,6 +1252,12 @@ public class BucketComparisonEngine
         public bool Completed { get; init; }
     }
 
+    /// <summary>Objects a worker has compared but not yet paid MaxObjectsPerSecond tokens for; carried across ranges.</summary>
+    private sealed class ObjectTokenAccount
+    {
+        public int Owed { get; set; }
+    }
+
     /// <summary>A worker's private state for one range.</summary>
     private sealed class RangeWork
     {
@@ -1207,7 +1274,6 @@ public class BucketComparisonEngine
         public string? LastCompletedKey { get; private set; }
         public string CurrentKeyA { get; set; } = "-";
         public string CurrentKeyB { get; set; } = "-";
-        public int SinceObjectTokens { get; set; }
 
         public RangeWork(int rangeIndex, string? lastCompletedKey)
         {

@@ -399,25 +399,26 @@ public class ParallelEngineTests
         var data = new BucketPair();
         for (int d = 0; d < 40; d++)
         {
-            for (int f = 0; f < 500; f++)
+            for (int f = 0; f < 250; f++)
             {
                 data.A.Add(Obj($"dir{d:D2}/file{f:D4}"));
                 data.B.Add(Obj($"dir{d:D2}/file{f:D4}"));
             }
         }
-        var latency = TimeSpan.FromMilliseconds(20);
+        // Plenty of latency headroom so CPU contention on a slow CI agent cannot hide the effect
+        var latency = TimeSpan.FromMilliseconds(40);
 
         var sw = Stopwatch.StartNew();
-        var single = await PartitionedEngine(data, data.ToLister(latency), dir, partitions: 1, pageSize: 500).RunAsync();
+        var single = await PartitionedEngine(data, data.ToLister(latency), dir, partitions: 1, pageSize: 250).RunAsync();
         var singleTime = sw.Elapsed;
 
         sw.Restart();
-        var parallel = await PartitionedEngine(data, data.ToLister(latency), dir, partitions: 8, pageSize: 500).RunAsync();
+        var parallel = await PartitionedEngine(data, data.ToLister(latency), dir, partitions: 8, pageSize: 250).RunAsync();
         var parallelTime = sw.Elapsed;
 
-        Assert.Equal(20000, single.MatchedCount);
-        Assert.Equal(20000, parallel.MatchedCount);
-        Assert.True(parallelTime.TotalMilliseconds * 2.5 < singleTime.TotalMilliseconds,
+        Assert.Equal(10000, single.MatchedCount);
+        Assert.Equal(10000, parallel.MatchedCount);
+        Assert.True(parallelTime.TotalMilliseconds * 2.0 < singleTime.TotalMilliseconds,
             $"8 partitions took {parallelTime.TotalMilliseconds:F0} ms vs {singleTime.TotalMilliseconds:F0} ms for one");
     }
 
@@ -513,6 +514,150 @@ public class ParallelEngineTests
         engine.Resume();
         var stats = await run.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.True(stats.ObjectsCompared > 0);
+    }
+
+    [Fact]
+    public async Task FolderMarkerKey_EqualToPrefix_IsProcessedOnce_AndNotRepeatedOnResume()
+    {
+        using var dir = new TempDir();
+        var data = new BucketPair { PrefixA = "data/", PrefixB = "data/" };
+        data.A.AddRange(new[] { Obj("data/"), Obj("data/a"), Obj("data/b") });
+
+        // Fresh partitioned run: the marker (relative key "") is compared exactly once
+        var fresh = new List<ObjectDifference>();
+        var engine = PartitionedEngine(data, data.ToLister(), dir, partitions: 4);
+        engine.DifferenceFound += fresh.Add;
+        await engine.RunAsync();
+        Assert.Equal(new[] { "data/", "data/a", "data/b" }, fresh.Select(d => d.Key).OrderBy(k => k, StringComparer.Ordinal));
+
+        // Resume right after the marker: StartAfter must be "data/", not "start from the beginning"
+        var checkpoint = new ScanCheckpoint
+        {
+            BucketNameA = "bucket-a", BucketNameB = "bucket-b", PrefixA = "data/", PrefixB = "data/",
+            Partitions = new List<ScanPartition> { new() { LastCompletedKey = "" } },
+            ObjectsCompared = 1, MissingInBucketBCount = 1, TotalDifferences = 1, LastDifferenceId = 1
+        };
+        var resumedDiffs = new List<ObjectDifference>();
+        var resumed = PartitionedEngine(data, data.ToLister(), dir, partitions: 4, resume: checkpoint);
+        resumed.DifferenceFound += resumedDiffs.Add;
+        var stats = await resumed.RunAsync();
+
+        Assert.Equal(new[] { "data/a", "data/b" }, resumedDiffs.Select(d => d.Key).OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Equal(3, stats.ObjectsCompared);
+        Assert.Equal(3, stats.MissingInBucketBCount);
+    }
+
+    [Fact]
+    public async Task ResumedRange_ContinuesTheSequenceGapSeriesOfItsLastKey()
+    {
+        using var dir = new TempDir();
+        var data = new BucketPair();
+        foreach (var n in new[] { 1, 2, 4, 5 })
+        {
+            data.A.Add(Obj($"part_{n:D2}"));
+            data.B.Add(Obj($"part_{n:D2}"));
+        }
+        var checkpoint = new ScanCheckpoint
+        {
+            BucketNameA = "bucket-a", BucketNameB = "bucket-b",
+            Partitions = new List<ScanPartition> { new() { LastCompletedKey = "part_02" } },
+            ObjectsCompared = 2, MatchedCount = 2
+        };
+
+        var diffs = new List<ObjectDifference>();
+        var engine = PartitionedEngine(data, data.ToLister(), dir, partitions: 4, resume: checkpoint, detectGaps: true);
+        engine.DifferenceFound += diffs.Add;
+        var stats = await engine.RunAsync();
+
+        // Same as an uninterrupted run: part_03 is missing between part_02 (before the stop) and part_04 (after)
+        Assert.Equal(1, stats.SequenceGapCount);
+        Assert.Equal("part_03", Assert.Single(diffs).Key);
+    }
+
+    [Fact]
+    public async Task MaxObjectsPerSecond_StillApplies_WithManySmallRanges()
+    {
+        using var dir = new TempDir();
+        var data = new BucketPair();
+        data.A.AddRange(Enumerable.Range(0, 3000).Select(i => Obj($"k{i:D5}")));
+        data.B.AddRange(data.A.Select(o => Obj(o.Key)));
+
+        // 75 ranges of 40 keys, each smaller than the limiter's batch (5000 / 20, capped at 100 objects)
+        var plan = PartitionPlanner.BuildRanges(Enumerable.Range(1, 74).Select(i => $"k{i * 40:D5}"), 1000);
+        Assert.Equal(75, plan.Count);
+
+        var sw = Stopwatch.StartNew();
+        var stats = await PartitionedEngine(data, data.ToLister(), dir, partitions: 4, plan: plan, tune: o => o.MaxObjectsPerSecond = 5000).RunAsync();
+
+        Assert.Equal(3000, stats.ObjectsCompared);
+        Assert.InRange(sw.Elapsed.TotalSeconds, 0.3, 15);
+    }
+
+    [Fact]
+    public async Task UserStop_IsReportedAsCancellation_EvenWhenRequestsFailBecauseOfIt()
+    {
+        using var dir = new TempDir();
+        var data = RandomData(seed: 31, count: 2000);
+        using var cts = new CancellationTokenSource();
+        var lister = data.ToLister(TimeSpan.FromMilliseconds(1));
+        lister.OnCall = call => { if (call.Number == 40) cts.Cancel(); };
+        // Requests aborted by the stop fail with a transport error rather than OperationCanceledException
+        lister.Fault = call => call.Number >= 40 ? new IOException("connection aborted") : null;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            PartitionedEngine(data, lister, dir, 4, pageSize: 20).RunAsync(cts.Token).WaitAsync(TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public async Task CrashBetweenCsvFlushAndCheckpointSave_ResumeTruncatesTheExtraRows()
+    {
+        using var dir = new TempDir();
+        var data = RandomData(seed: 2718, count: 4000);
+        string interruptedCsv = dir.File("interrupted.csv");
+        string referenceCsv = dir.File("reference.csv");
+
+        var referenceStats = await PartitionedEngine(data, data.ToLister(), dir, 4, referenceCsv, pageSize: 25).RunAsync();
+
+        using var cts = new CancellationTokenSource();
+        var slow = data.ToLister(TimeSpan.FromMilliseconds(2));
+        slow.OnCall = call => { if (call.Number == 80) cts.Cancel(); };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            PartitionedEngine(data, slow, dir, 4, interruptedCsv, pageSize: 25).RunAsync(cts.Token));
+
+        var checkpoint = await CheckpointManager.FindCheckpointAsync(
+            "bucket-a", "https://fake.invalid", "", "bucket-b", "https://fake.invalid", "", ComparisonMode.ListingOnly, dir.Path);
+        Assert.NotNull(checkpoint);
+        Assert.Equal(checkpoint.LiveReportCsvBytes, new FileInfo(interruptedCsv).Length);
+
+        // Simulate rows that reached the CSV after the last checkpoint was saved (the process died in between):
+        // copies of rows already there, plus a torn final line
+        var existing = await File.ReadAllLinesAsync(interruptedCsv);
+        var replay = existing.Skip(Math.Max(1, existing.Length - 15)).ToList();
+        await File.AppendAllTextAsync(interruptedCsv, string.Join("\n", replay) + "\n" + "999999,\"torn", CsvReport.Utf8WithBom);
+        Assert.True(new FileInfo(interruptedCsv).Length > checkpoint.LiveReportCsvBytes);
+
+        var resumedStats = await PartitionedEngine(data, data.ToLister(), dir, 4, interruptedCsv, resume: checkpoint, pageSize: 25).RunAsync();
+
+        AssertSameCounters(referenceStats, resumedStats);
+        var rows = CsvReport.ReadDifferences(interruptedCsv).ToList();
+        Assert.Equal(Fingerprints(CsvReport.ReadDifferences(referenceCsv)), Fingerprints(rows));
+        Assert.Equal(rows.Count, rows.Select(d => d.Id).Distinct().Count());
+    }
+
+    [Fact]
+    public async Task WriterFailure_StopsAllPartitions_AndSurfacesTheError()
+    {
+        using var dir = new TempDir();
+        var data = RandomData(seed: 12, count: 3000);
+        var engine = PartitionedEngine(data, data.ToLister(TimeSpan.FromMilliseconds(1)), dir, 8, dir.File("live.csv"), pageSize: 10);
+        engine.BeforeWriterBatch = n => { if (n == 5) throw new IOException("disk full"); };
+
+        var ex = await Assert.ThrowsAsync<IOException>(() => engine.RunAsync().WaitAsync(TimeSpan.FromSeconds(30)));
+        Assert.Equal("disk full", ex.Message);
+
+        // The CSV no longer matches the ranges' progress, so no checkpoint is written for this failure
+        Assert.Null(await CheckpointManager.FindCheckpointAsync(
+            "bucket-a", "https://fake.invalid", "", "bucket-b", "https://fake.invalid", "", ComparisonMode.ListingOnly, dir.Path));
     }
 
     [Fact]

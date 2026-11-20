@@ -54,7 +54,66 @@ public class EngineBehaviorTests
         Assert.Equal("x2", BucketComparisonEngine.ToRelativeKey("in/x2", "in/"));
         Assert.Equal("in/x2", BucketComparisonEngine.BuildStartAfter("in/", "x2"));
         Assert.Equal("out/x2", BucketComparisonEngine.BuildStartAfter("out/", "x2"));
-        Assert.Null(BucketComparisonEngine.BuildStartAfter("in/", ""));
+        Assert.Null(BucketComparisonEngine.BuildStartAfter("in/", null));
+        // The empty relative key is the folder marker "in/" itself: StartAfter = "in/" skips exactly that object
+        Assert.Equal("in/", BucketComparisonEngine.BuildStartAfter("in/", ""));
+        // Without a prefix there is no empty key to skip
+        Assert.Null(BucketComparisonEngine.BuildStartAfter("", ""));
+    }
+
+    [Fact]
+    public async Task FullData_TransientErrors_AreRetriedOnce_ThenRecordedPerKey()
+    {
+        var itemsA = new[] { Obj("a-flaky", 10, "x"), Obj("b-io", 10, "x"), Obj("c-http", 10, "x"), Obj("d-timeout", 10, "x"), Obj("e-ok", 10, "x") };
+        var itemsB = itemsA.Select(o => Obj(o.Key, 10, "y")).ToArray();
+        var attempts = new Dictionary<string, int>();
+
+        var diffs = new List<ObjectDifference>();
+        var engine = new BucketComparisonEngine(
+            new MockS3ObjectStream(itemsA), new MockS3ObjectStream(itemsB), ComparisonMode.FullData, detectSequenceGaps: false)
+        {
+            ContentComparer = (a, b, ct) =>
+            {
+                attempts[a.Key] = attempts.GetValueOrDefault(a.Key) + 1;
+                return a.Key switch
+                {
+                    "a-flaky" when attempts[a.Key] == 1 => throw new IOException("connection reset"),
+                    "b-io" => throw new IOException("connection reset"),
+                    "c-http" => throw new System.Net.Http.HttpRequestException("502 from proxy"),
+                    "d-timeout" => throw new TaskCanceledException("HTTP request timed out"),
+                    _ => Task.FromResult(true)
+                };
+            }
+        };
+        engine.DifferenceFound += diffs.Add;
+
+        var stats = await engine.RunAsync();
+
+        Assert.Equal(5, stats.ObjectsCompared);
+        Assert.Equal(2, stats.MatchedCount);   // a-flaky (second try) and e-ok
+        Assert.Equal(3, stats.ContentCheckErrorCount);
+        Assert.Equal(new[] { "b-io", "c-http", "d-timeout" }, diffs.Select(d => d.Key).OrderBy(k => k));
+        Assert.All(diffs, d => Assert.Contains("after 2 attempts", d.Details));
+        Assert.Equal(2, attempts["a-flaky"]);
+    }
+
+    [Fact]
+    public async Task FullData_StopDuringDownload_IsACancellation_NotAContentError()
+    {
+        using var cts = new CancellationTokenSource();
+        var engine = new BucketComparisonEngine(
+            new MockS3ObjectStream(new[] { Obj("k", 10, "x") }), new MockS3ObjectStream(new[] { Obj("k", 10, "y") }),
+            ComparisonMode.FullData, detectSequenceGaps: false)
+        {
+            ContentComparer = async (_, _, ct) =>
+            {
+                cts.Cancel();
+                await Task.Delay(Timeout.Infinite, ct);
+                return true;
+            }
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => engine.RunAsync(cts.Token));
     }
 
     [Fact]
