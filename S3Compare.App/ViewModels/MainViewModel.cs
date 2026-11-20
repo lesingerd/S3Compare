@@ -65,6 +65,14 @@ public class MainViewModel : INotifyPropertyChanged
     private bool _detectSequenceGaps = true;
     private int _maxSequenceGapThreshold = 25;
 
+    // Performance / throttling (identical names in S3CompareService)
+    private int _maxParallelPartitions = ScanPerformanceOptions.DefaultMaxParallelPartitions;
+    private int _prefetchPages = ScanPerformanceOptions.DefaultPrefetchPages;
+    private int _maxListRequestsPerSecond = ScanPerformanceOptions.DefaultMaxListRequestsPerSecond;
+    private int _maxObjectsPerSecond = ScanPerformanceOptions.DefaultMaxObjectsPerSecond;
+    private int _maxConcurrentContentChecks = ScanPerformanceOptions.DefaultMaxConcurrentContentChecks;
+    private int _maxDiscoveryRequests = ScanPerformanceOptions.DefaultMaxDiscoveryRequests;
+
     // Checkpoint & Resume state (NO credentials/keys saved)
     private bool _hasResumableCheckpoint = false;
     private string _checkpointBannerText = string.Empty;
@@ -394,8 +402,55 @@ public class MainViewModel : INotifyPropertyChanged
         set => SetField(ref _maxSequenceGapThreshold, value);
     }
 
+    public int MaxParallelPartitions
+    {
+        get => _maxParallelPartitions;
+        set => SetField(ref _maxParallelPartitions, value);
+    }
+
+    public int PrefetchPages
+    {
+        get => _prefetchPages;
+        set => SetField(ref _prefetchPages, value);
+    }
+
+    public int MaxListRequestsPerSecond
+    {
+        get => _maxListRequestsPerSecond;
+        set => SetField(ref _maxListRequestsPerSecond, value);
+    }
+
+    public int MaxObjectsPerSecond
+    {
+        get => _maxObjectsPerSecond;
+        set => SetField(ref _maxObjectsPerSecond, value);
+    }
+
+    public int MaxConcurrentContentChecks
+    {
+        get => _maxConcurrentContentChecks;
+        set => SetField(ref _maxConcurrentContentChecks, value);
+    }
+
+    public int MaxDiscoveryRequests
+    {
+        get => _maxDiscoveryRequests;
+        set => SetField(ref _maxDiscoveryRequests, value);
+    }
+
+    public ScanPerformanceOptions BuildPerformanceOptions() => new()
+    {
+        MaxParallelPartitions = MaxParallelPartitions,
+        PrefetchPages = PrefetchPages,
+        MaxListRequestsPerSecond = MaxListRequestsPerSecond,
+        MaxObjectsPerSecond = MaxObjectsPerSecond,
+        MaxConcurrentContentChecks = MaxConcurrentContentChecks,
+        MaxDiscoveryRequests = MaxDiscoveryRequests
+    };
+
     public bool HasResumableCheckpoint
     {
+
         get => _hasResumableCheckpoint;
         set
         {
@@ -574,11 +629,11 @@ public class MainViewModel : INotifyPropertyChanged
         // A newer check started while we were reading; its result wins
         if (ticket != _checkpointCheckTicket) return;
 
-        if (cp != null && !string.IsNullOrEmpty(cp.LastEvaluatedKey))
+        if (cp != null && cp.HasProgress)
         {
             ActiveCheckpoint = cp;
             HasResumableCheckpoint = true;
-            CheckpointBannerText = $"Found saved scan checkpoint at key '{cp.LastEvaluatedKey}' ({cp.ObjectsCompared:N0} objects evaluated, {cp.TotalDifferences:N0} diffs).";
+            CheckpointBannerText = $"Found saved scan checkpoint {cp.DescribeProgress()} ({cp.ObjectsCompared:N0} objects evaluated, {cp.TotalDifferences:N0} diffs).";
         }
         else
         {
@@ -817,6 +872,14 @@ public class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        var performance = BuildPerformanceOptions();
+        var performanceErrors = performance.Validate();
+        if (performanceErrors.Count > 0)
+        {
+            MessageBox.Show("Please correct the Performance / Throttling settings:\n\n" + string.Join("\n", performanceErrors), "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
         if (IsFullDataMode)
         {
             var prompt = MessageBox.Show(
@@ -844,7 +907,7 @@ public class MainViewModel : INotifyPropertyChanged
             }
 
             StatusMessage = isResuming
-                ? $"Resuming streaming scan from checkpoint key '{checkpointToUse?.LastEvaluatedKey}'..."
+                ? $"Resuming streaming scan from checkpoint ({checkpointToUse?.DescribeProgress()})..."
                 : "Initializing streaming comparison...";
             StatusA = "Connecting...";
             StatusB = "Connecting...";
@@ -895,7 +958,8 @@ public class MainViewModel : INotifyPropertyChanged
                 csvPath,
                 checkpointToUse,
                 DetectSequenceGaps,
-                MaxSequenceGapThreshold);
+                MaxSequenceGapThreshold,
+                performance);
             _engine = engine;
 
             var dispatcher = Application.Current?.Dispatcher;
@@ -920,7 +984,9 @@ public class MainViewModel : INotifyPropertyChanged
                     BytesReadB = S3ObjectSummary.FormatSize(stats.BucketBBytesRead);
                     StatusA = $"Paging ({stats.BucketAObjectsRead:N0} objects read)";
                     StatusB = $"Paging ({stats.BucketBObjectsRead:N0} objects read)";
-                    StatusMessage = $"Streaming comparison in progress... {stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | RAM: {stats.WorkingSetMB:F0} MB";
+                    StatusMessage = stats.Phase == "Planning"
+                        ? "Planning key-range partitions (listing folder structure of both buckets)..."
+                        : $"Streaming comparison in progress... {stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | Partitions: {stats.PartitionsCompleted:N0}/{stats.PartitionsTotal:N0} done, {stats.ActivePartitions} active | RAM: {stats.WorkingSetMB:F0} MB";
                 });
             };
 
@@ -1106,24 +1172,29 @@ public class MainViewModel : INotifyPropertyChanged
                 bool json = target.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
                 var gridCopy = haveSessionCsv ? null : Differences.ToList();
 
-                // Heavy file I/O (the report can hold millions of rows) stays off the UI thread
-                await Task.Run(async () =>
+                // Heavy file I/O (the report can hold millions of rows) stays off the UI thread.
+                // Parallel scans find differences out of key order: reports up to MaxSortedExportRows rows are sorted by key.
+                bool sorted = await Task.Run(async () =>
                 {
                     if (json)
                     {
-                        IEnumerable<ObjectDifference> source = haveSessionCsv ? CsvReport.ReadDifferences(sessionCsv!) : gridCopy!;
+                        IEnumerable<ObjectDifference> source = haveSessionCsv
+                            ? (IEnumerable<ObjectDifference>?)ReportExporter.TryLoadSorted(CsvReport.ReadDifferences(sessionCsv!)) ?? CsvReport.ReadDifferences(sessionCsv!)
+                            : ReportExporter.TryLoadSorted(gridCopy!)!;
                         await ReportExporter.ExportToJsonAsync(target, source, stats);
+                        return source is List<ObjectDifference>;
                     }
-                    else if (haveSessionCsv)
+                    if (haveSessionCsv)
                     {
-                        await ReportExporter.ExportFromSessionCsvAsync(target, sessionCsv!, stats);
+                        return await ReportExporter.ExportFromSessionCsvAsync(target, sessionCsv!, stats);
                     }
-                    else
-                    {
-                        await ReportExporter.ExportToCsvAsync(target, gridCopy!, stats);
-                    }
+                    await ReportExporter.ExportToCsvAsync(target, ReportExporter.TryLoadSorted(gridCopy!)!, stats);
+                    return true;
                 });
-                MessageBox.Show($"Report exported successfully to:\n{target}", "Export Succeeded", MessageBoxButton.OK, MessageBoxImage.Information);
+                string order = sorted
+                    ? "Rows are sorted by key."
+                    : $"The report has more than {ReportExporter.MaxSortedExportRows:N0} rows, so rows are in discovery order (parallel scans find differences out of key order).";
+                MessageBox.Show($"Report exported successfully to:\n{target}\n\n{order}", "Export Succeeded", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
