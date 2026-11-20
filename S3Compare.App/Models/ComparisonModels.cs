@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace S3Compare.App.Models;
 
 public enum ComparisonMode
@@ -140,11 +142,94 @@ public class ComparisonStatistics
     public double GCTotalMemoryMB { get; set; }
     public string LastCheckpointKey { get; set; } = "-";
     public DateTime? LastCheckpointTime { get; set; }
+
+    // Parallel scan progress
+    public string Phase { get; set; } = "Idle";
+    public int PartitionsTotal { get; set; }
+    public int PartitionsCompleted { get; set; }
+    public int ActivePartitions { get; set; }
+}
+
+/// <summary>
+/// One slice of the keyspace, over keys relative to each bucket's own prefix: Lower &lt; key &lt;= Upper in UTF-8 byte order.
+/// A null Lower/Upper is unbounded. The partitions of a plan tile the keyspace exactly.
+/// </summary>
+public class ScanPartition
+{
+    public string? Lower { get; set; }
+    public string? Upper { get; set; }
+
+    /// <summary>Last relative key whose differences are all in the live CSV; the range resumes after it.</summary>
+    public string? LastCompletedKey { get; set; }
+    public bool Completed { get; set; }
+
+    public ScanPartition Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed };
+
+    public override string ToString() => $"({Lower ?? "-inf"}, {Upper ?? "+inf"}]";
+}
+
+/// <summary>Throughput and throttling settings. None of them affect which differences are found, only how fast.</summary>
+public class ScanPerformanceOptions
+{
+    public const int DefaultMaxParallelPartitions = 8;
+    public const int DefaultPrefetchPages = 2;
+    public const int DefaultMaxListRequestsPerSecond = 20;
+    public const int DefaultMaxObjectsPerSecond = 0;
+    public const int DefaultMaxConcurrentContentChecks = 8;
+    public const int DefaultMaxDiscoveryRequests = 500;
+
+    /// <summary>Key ranges compared concurrently. 1 = a single range (still prefetching).</summary>
+    public int MaxParallelPartitions { get; set; } = DefaultMaxParallelPartitions;
+
+    /// <summary>Pages buffered ahead of the comparison per bucket listing.</summary>
+    public int PrefetchPages { get; set; } = DefaultPrefetchPages;
+
+    /// <summary>Per-bucket cap on S3 requests per second, shared by all partitions. 0 = unlimited.</summary>
+    public int MaxListRequestsPerSecond { get; set; } = DefaultMaxListRequestsPerSecond;
+
+    /// <summary>Aggregate cap on objects compared per second. 0 = unlimited.</summary>
+    public int MaxObjectsPerSecond { get; set; } = DefaultMaxObjectsPerSecond;
+
+    /// <summary>Full Data mode: object pairs downloaded at the same time, across all partitions.</summary>
+    public int MaxConcurrentContentChecks { get; set; } = DefaultMaxConcurrentContentChecks;
+
+    /// <summary>Budget of LIST requests (both buckets together) the partition planner may spend.</summary>
+    public int MaxDiscoveryRequests { get; set; } = DefaultMaxDiscoveryRequests;
+
+    /// <summary>Number of key ranges the planner aims for; workers pull ranges from a queue.</summary>
+    public int TargetPartitions => MaxParallelPartitions * 4;
+
+    /// <summary>Connections each S3 client may open: every partition lists both buckets, plus content downloads.</summary>
+    public int RequiredConnectionsPerServer => 2 * MaxParallelPartitions + MaxConcurrentContentChecks;
+
+    /// <summary>Returns human-readable problems; empty when the options are valid.</summary>
+    public List<string> Validate()
+    {
+        var errors = new List<string>();
+        Check(errors, nameof(MaxParallelPartitions), MaxParallelPartitions, 1, 256);
+        Check(errors, nameof(PrefetchPages), PrefetchPages, 1, 64);
+        Check(errors, nameof(MaxListRequestsPerSecond), MaxListRequestsPerSecond, 0, 100_000);
+        Check(errors, nameof(MaxObjectsPerSecond), MaxObjectsPerSecond, 0, 100_000_000);
+        Check(errors, nameof(MaxConcurrentContentChecks), MaxConcurrentContentChecks, 1, 256);
+        Check(errors, nameof(MaxDiscoveryRequests), MaxDiscoveryRequests, 0, 100_000);
+        return errors;
+    }
+
+    private static void Check(List<string> errors, string name, int value, int min, int max)
+    {
+        if (value < min || value > max)
+        {
+            errors.Add($"{name} must be between {min:N0} and {max:N0} (was {value:N0}).");
+        }
+    }
+
+    public ScanPerformanceOptions Clone() => (ScanPerformanceOptions)MemberwiseClone();
 }
 
 public class ScanCheckpoint
 {
-    public int Version { get; set; } = 1;
+    /// <summary>1 = single key (LastEvaluatedKey); 2 = partition plan (Partitions).</summary>
+    public int Version { get; set; } = 2;
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime LastUpdatedAt { get; set; } = DateTime.UtcNow;
 
@@ -160,8 +245,36 @@ public class ScanCheckpoint
     public string PrefixB { get; set; } = string.Empty;
 
     public ComparisonMode Mode { get; set; }
-    /// <summary>Last fully processed key, relative to each bucket's own prefix (prefix stripped).</summary>
+
+    /// <summary>
+    /// Version 1: last fully processed key, relative to each bucket's own prefix (prefix stripped).
+    /// Version 2 fills it only when the plan is a single unbounded range; otherwise progress is in <see cref="Partitions"/>.
+    /// </summary>
     public string LastEvaluatedKey { get; set; } = string.Empty;
+
+    /// <summary>The partition plan with per-range progress (version 2). Null for version 1 checkpoints.</summary>
+    public List<ScanPartition>? Partitions { get; set; }
+
+    /// <summary>Highest difference Id handed out, so a resumed scan never reuses an Id already in the live CSV.</summary>
+    public long LastDifferenceId { get; set; }
+
+    [JsonIgnore]
+    public bool HasProgress =>
+        !string.IsNullOrEmpty(LastEvaluatedKey)
+        || (Partitions?.Any(p => p.Completed || !string.IsNullOrEmpty(p.LastCompletedKey)) ?? false);
+
+    public string DescribeProgress()
+    {
+        if (Partitions is { Count: > 1 })
+        {
+            int done = Partitions.Count(p => p.Completed);
+            return $"{done}/{Partitions.Count} partitions complete";
+        }
+        string key = Partitions is { Count: 1 } ? Partitions[0].LastCompletedKey ?? LastEvaluatedKey : LastEvaluatedKey;
+        return $"at key '{key}'";
+    }
+
+
     public string? LiveReportCsvPath { get; set; }
 
     /// <summary>Length in bytes of the live CSV when this checkpoint was taken; the file is truncated to this on resume.</summary>

@@ -31,16 +31,25 @@ public static class S3ClientFactory
         };
     }
 
-    public static AmazonS3Client CreateClient(S3BucketConfig config)
+    /// <param name="maxConnectionsPerServer">
+    /// HTTP connections the client may open to the endpoint; a parallel scan needs one per in-flight LIST and download.
+    /// 0 keeps the SDK default.
+    /// </param>
+    public static AmazonS3Client CreateClient(S3BucketConfig config, int maxConnectionsPerServer = 0)
     {
         var credentials = new BasicAWSCredentials(config.AccessKey.Trim(), config.SecretKey.Trim());
-        
+
         var s3Config = new AmazonS3Config
         {
             ForcePathStyle = true,
             Timeout = TimeSpan.FromSeconds(45),
             MaxErrorRetry = 3
         };
+
+        if (maxConnectionsPerServer > 0)
+        {
+            s3Config.MaxConnectionsPerServer = maxConnectionsPerServer;
+        }
 
         if (!string.IsNullOrWhiteSpace(config.EndpointUrl))
         {

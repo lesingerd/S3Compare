@@ -371,7 +371,14 @@ public class StreamingComparisonTests
 
         var runTask = Task.Run(() => engine.RunAsync());
 
-        await Task.Delay(600);
+        // Wait for the pause (and for the writer to publish what was finished before it) instead of guessing a delay,
+        // so a busy thread pool cannot make this flaky
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while ((!engine.IsPaused || Volatile.Read(ref diffCount) < 49) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+        await Task.Delay(200);
         Assert.False(runTask.IsCompleted);
         Assert.True(engine.IsPaused);
         int pausedCount = Volatile.Read(ref diffCount);
