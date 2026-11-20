@@ -327,7 +327,7 @@ public class ParallelEngineTests
     }
 
     [Fact]
-    public async Task VersionOneCheckpoint_ResumesAsSingleRange()
+    public async Task VersionOneCheckpoint_IsReplannedAfterItsKey_AndResumesInParallel()
     {
         using var dir = new TempDir();
         var data = new BucketPair();
@@ -349,7 +349,8 @@ public class ParallelEngineTests
         engine.DifferenceFound += diffs.Add;
         var stats = await engine.RunAsync();
 
-        Assert.Equal(1, stats.PartitionsTotal);
+        Assert.True(stats.PartitionsTotal >= 8, $"expected the rest of the keyspace to be split, got {stats.PartitionsTotal} range(s)");
+        Assert.Equal(stats.PartitionsTotal, stats.PartitionsCompleted);
         Assert.Equal(1000, stats.ObjectsCompared);
         Assert.Equal(1000, stats.MissingInBucketBCount);
         Assert.Equal(500, diffs.Count);
@@ -501,7 +502,8 @@ public class ParallelEngineTests
     {
         using var dir = new TempDir();
         var data = RandomData(seed: 5, count: 3000);
-        var engine = PartitionedEngine(data, data.ToLister(TimeSpan.FromMilliseconds(2)), dir, partitions: 4, pageSize: 10);
+        var lister = data.ToLister(TimeSpan.FromMilliseconds(2));
+        var engine = PartitionedEngine(data, lister, dir, partitions: 4, pageSize: 10);
         long lastCompared = 0;
         engine.ProgressUpdated += s => Interlocked.Exchange(ref lastCompared, s.ObjectsCompared);
 
@@ -510,6 +512,7 @@ public class ParallelEngineTests
         await Task.Delay(400);
         Assert.False(run.IsCompleted);
         Assert.Equal(0, Interlocked.Read(ref lastCompared));
+        Assert.Equal(0, lister.CallCount);   // not even the planner lists while paused
 
         engine.Resume();
         var stats = await run.WaitAsync(TimeSpan.FromSeconds(30));

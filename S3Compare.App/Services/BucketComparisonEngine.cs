@@ -541,8 +541,13 @@ public class BucketComparisonEngine
                 return plan;
             }
 
-            // Version 1 checkpoint: one key for the whole scan, so resume as a single range
-            return new List<ScanPartition> { new() { LastCompletedKey = NullIfEmpty(_resumeCheckpoint.LastEvaluatedKey) } };
+            // Version 1 checkpoint: one key for the whole scan. Plan the keyspace after it so the rest still runs in parallel.
+            string? resumeKey = NullIfEmpty(_resumeCheckpoint.LastEvaluatedKey);
+            if (_options.MaxParallelPartitions <= 1 || listerA == null || listerB == null)
+            {
+                return new List<ScanPartition> { new() { LastCompletedKey = resumeKey } };
+            }
+            return await PlanWithPlannerAsync(listerA, listerB, resumeKey, cancellationToken).ConfigureAwait(false);
         }
 
         if (_options.MaxParallelPartitions <= 1)
@@ -550,12 +555,26 @@ public class BucketComparisonEngine
             return new List<ScanPartition> { new() };
         }
 
-        return await PartitionPlanner.PlanAsync(
-            new PlannerBucket(listerA!, _configA!.BucketName, _prefixA, _limiterA),
-            new PlannerBucket(listerB!, _configB!.BucketName, _prefixB, _limiterB),
+        return await PlanWithPlannerAsync(listerA!, listerB!, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task<List<ScanPartition>> PlanWithPlannerAsync(IS3Lister listerA, IS3Lister listerB, string? afterRelativeKey, CancellationToken cancellationToken)
+    {
+        return PartitionPlanner.PlanAsync(
+            new PlannerBucket(listerA, _configA!.BucketName, _prefixA, _limiterA),
+            new PlannerBucket(listerB, _configB!.BucketName, _prefixB, _limiterB),
             _options.TargetPartitions,
             _options.MaxDiscoveryRequests,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            afterRelativeKey,
+            WaitWhilePausedAsync);
+    }
+
+    /// <summary>Waits while the scan is paused (used between planner requests).</summary>
+    private Task WaitWhilePausedAsync(CancellationToken cancellationToken)
+    {
+        var gate = _pauseGate;
+        return gate == null ? Task.CompletedTask : gate.Task.WaitAsync(cancellationToken);
     }
 
     private static string? NullIfEmpty(string? s) => string.IsNullOrEmpty(s) ? null : s;
@@ -690,6 +709,7 @@ public class BucketComparisonEngine
                     await CommitAsync(work, commits, completed: false, cancellationToken).ConfigureAwait(false);
                 }
 
+                // One token per compared key: a matched A/B pair is a single iteration, so it costs 1, like a one-sided key
                 if (_objectLimiter != null && ++objectTokens.Owed >= _objectBatch)
                 {
                     int owed = objectTokens.Owed;

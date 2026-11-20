@@ -329,6 +329,78 @@ public class PartitionPlannerTests
         AssertTilesAndCovers(ranges, keys);
     }
 
+    [Theory]
+    [InlineData("file_{0:D5}.dat")]
+    [InlineData("IMG_{0:D4}.jpg")]
+    [InlineData("logs-2024-01-01T00-00-00-{0:D6}.json")]
+    public async Task FlatKeysWithALongSharedPrefix_AreSplitEvenly(string pattern)
+    {
+        var keys = Enumerable.Range(0, 3000).Select(i => string.Format(pattern, i)).ToList();
+        var lister = new FakeS3Lister().SetBucket("a", keys.Select(Obj)).SetBucket("b", keys.Select(Obj));
+
+        var ranges = await PartitionPlanner.PlanAsync(new PlannerBucket(lister, "a", ""), new PlannerBucket(lister, "b", ""), 8, 500);
+
+        Assert.True(ranges.Count >= 8, $"expected at least 8 ranges, got {ranges.Count}");
+        AssertTilesAndCovers(ranges, keys);
+        int largest = ranges.Max(r => keys.Count(k => PartitionPlanner.Contains(r, k)));
+        Assert.True(largest <= keys.Count / 4, $"largest range holds {largest} of {keys.Count} keys");
+        Assert.True(lister.CallCount <= 500);
+    }
+
+    [Fact]
+    public async Task FlatKeysWithALongSharedPrefix_SmallBudget_StillSplits()
+    {
+        var keys = Enumerable.Range(0, 3000).Select(i => $"file_{i:D5}.dat").ToList();
+        var lister = new FakeS3Lister().SetBucket("a", keys.Select(Obj)).SetBucket("b", keys.Select(Obj));
+
+        // 2 delimiter listings, then 34 probes per bucket: enough to descend the shared prefix and branch once or twice
+        var ranges = await PartitionPlanner.PlanAsync(new PlannerBucket(lister, "a", ""), new PlannerBucket(lister, "b", ""), 32, 70);
+
+        Assert.True(lister.CallCount <= 70);
+        AssertTilesAndCovers(ranges, keys);
+        Assert.True(ranges.Count >= 3, $"expected the shared prefix to be descended, got {ranges.Count} range(s)");
+        int largest = ranges.Max(r => keys.Count(k => PartitionPlanner.Contains(r, k)));
+        Assert.True(largest <= keys.Count / 2, $"largest range holds {largest} of {keys.Count} keys");
+    }
+
+    [Fact]
+    public async Task AfterKey_PlansOnlyTheRestOfTheKeyspace()
+    {
+        var keys = Enumerable.Range(0, 1000).Select(i => $"k{i:D4}").ToList();
+        var lister = new FakeS3Lister().SetBucket("a", keys.Select(Obj)).SetBucket("b", Array.Empty<S3ObjectSummary>());
+
+        var ranges = await PartitionPlanner.PlanAsync(new PlannerBucket(lister, "a", ""), new PlannerBucket(lister, "b", ""), 16, 500, afterRelativeKey: "k0499");
+
+        Assert.True(ranges.Count >= 8, $"expected the keys after k0499 to be split, got {ranges.Count}");
+        Assert.True(PartitionPlanner.TilesKeyspace(ranges));
+        Assert.Equal("k0499", ranges[0].LastCompletedKey);
+        Assert.All(ranges.Skip(1), r => Assert.Null(r.LastCompletedKey));
+        Assert.All(ranges.Where(r => r.Upper != null), r => Assert.True(string.CompareOrdinal(r.Upper, "k0499") > 0));
+        var rest = keys.Where(k => string.CompareOrdinal(k, "k0499") > 0).ToList();
+        int largest = ranges.Max(r => rest.Count(k => PartitionPlanner.Contains(r, k)));
+        Assert.True(largest <= rest.Count / 4, $"largest range holds {largest} of {rest.Count} remaining keys");
+    }
+
+    [Fact]
+    public async Task WaitIfPaused_IsAwaitedBeforeEveryRequest()
+    {
+        var keys = Enumerable.Range(0, 3000).Select(i => $"file_{i:D5}.dat").ToList();
+        var lister = new FakeS3Lister().SetBucket("a", keys.Select(Obj)).SetBucket("b", keys.Select(Obj));
+        int waits = 0;
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var planning = PartitionPlanner.PlanAsync(new PlannerBucket(lister, "a", ""), new PlannerBucket(lister, "b", ""), 8, 500,
+            waitIfPaused: _ => { Interlocked.Increment(ref waits); return gate.Task; });
+        await Task.Delay(100);
+        Assert.False(planning.IsCompleted);
+        Assert.Equal(0, lister.CallCount);
+
+        gate.SetResult();
+        await planning.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(lister.CallCount > 0);
+        Assert.Equal(lister.CallCount, Volatile.Read(ref waits));
+    }
+
     [Fact]
     public void PerformanceOptions_Validate()
     {
