@@ -58,7 +58,7 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
 ### 3. Synthetic Sequence Gap Detection (Missing on Both Sides)
 - Identifies files potentially missing in *both* buckets based on numerical sequencing patterns (e.g., `file_01`, `file_02`, `file_04` detected $\rightarrow$ flags `file_03` as missing).
 - Operates in $O(1)$ streaming time across directory paths and filename patterns.
-- Each key-range partition has its own detector, so a gap that straddles a partition boundary (or a resume point) is not reported. Set `MaxParallelPartitions` to 1 if you rely on gap detection across a whole listing.
+- Each key-range partition has its own detector, so a gap that straddles a partition boundary is not reported. As a result the **gap count can vary with the partition plan** (that is, with `MaxParallelPartitions`, `MaxDiscoveryRequests` and the bucket layout), while all other difference counts never do. A resumed range continues the series of the key it stopped after, so stopping and resuming does not change the result. Set `MaxParallelPartitions` to 1 if you rely on gap detection across a whole listing.
 - Configurable **Max Gap Threshold** (default: 25) prevents false alarms from intentional non-sequential numbers.
 - Tagged with **Missing on Both Sides (Gap)** in pink (`#EC4899`) on dashboard cards and discrepancy reports.
 
@@ -76,6 +76,7 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
   - Never downloads object byte payloads, preventing unexpected cloud egress transfer costs from Wasabi, AWS, or cloud providers.
 - **🔍 Full Data Comparison (Payload Verification)**:
   - When keys and sizes match, streams object byte payloads in 64 KB buffers to verify byte-for-byte content equality.
+  - A download that fails for one object (service error such as Glacier `InvalidObjectState` or `AccessDenied`, or a network error / timeout, which is retried once) is recorded as a **Content Check Error** for that key and the scan continues.
   - Displays a confirmation warning before starting to safeguard against inadvertent bandwidth charges.
 
 ### 6. Continuous Diagnostics & Crash Logging
@@ -100,7 +101,7 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
 
 1. **Prefetch + concurrent A/B**: each listing runs on a background producer that requests page N+1 as soon as page N arrives, into a bounded buffer of `PrefetchPages` pages. Bucket A and Bucket B are listed at the same time, so a page costs one round trip instead of latency(A) + latency(B).
 2. **Key-range partitioning**: S3 lists keys in UTF-8 byte order, so the keyspace (relative to each bucket's own prefix) is split into ranges `(lower, upper]` that are compared by independent merge-joins. Each range lists both buckets with `StartAfter = prefix + lower` and stops after `upper`.
-   - **Planning** (before the scan, at most `MaxDiscoveryRequests` LIST calls): `Delimiter="/"` listings on both buckets, descending up to 3 folder levels, collect folder names as candidate boundaries. Flat namespaces fall back to `MaxKeys=1` probes at each printable ASCII first character (then two-character probes) to sample real keys. About `MaxParallelPartitions × 4` evenly spaced boundaries are chosen; workers pull ranges from a queue so uneven ranges balance out.
+   - **Planning** (before the scan, at most `MaxDiscoveryRequests` LIST calls): `Delimiter="/"` listings on both buckets, descending up to 3 folder levels, collect folder names as candidate boundaries. Flat namespaces fall back to `MaxKeys=1` probes at each printable ASCII first character (then two-character probes) to sample real keys; probes are issued coarse to fine (spread over the whole character range first) and the remaining budget is split between the buckets, so a small budget still covers the whole keyspace. About `MaxParallelPartitions × 4` evenly spaced boundaries are chosen; workers pull ranges from a queue so uneven ranges balance out.
    - The ranges always tile the keyspace exactly, so **planning quality only affects speed, never results**: a partitioned scan reports exactly the same differences and counts as a single-stream scan.
 
 All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles.
@@ -164,7 +165,7 @@ dotnet run --project S3Compare.App/S3Compare.App.csproj
 ```powershell
 dotnet test
 ```
-*Runs all 72 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
+*Runs all 83 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
 
 ### Publish Standalone Executable
 ```powershell
