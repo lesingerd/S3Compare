@@ -1179,7 +1179,9 @@ public class MainViewModel : INotifyPropertyChanged
                     if (json)
                     {
                         IEnumerable<ObjectDifference> source = haveSessionCsv
-                            ? (IEnumerable<ObjectDifference>?)ReportExporter.TryLoadSorted(CsvReport.ReadDifferences(sessionCsv!)) ?? CsvReport.ReadDifferences(sessionCsv!)
+                            ? (ReportExporter.SessionCsvFitsSortLimit(sessionCsv!)
+                                ? ReportExporter.TryLoadSorted(CsvReport.ReadDifferences(sessionCsv!))
+                                : null) ?? CsvReport.ReadDifferences(sessionCsv!)
                             : ReportExporter.TryLoadSorted(gridCopy!)!;
                         await ReportExporter.ExportToJsonAsync(target, source, stats);
                         return source is List<ObjectDifference>;

@@ -36,6 +36,15 @@ public static class ReportExporter
     }
 
     /// <summary>
+    /// Cheap pre-check before sorting a session CSV: counts records without building rows and stops once the cap is passed.
+    /// </summary>
+    public static bool SessionCsvFitsSortLimit(string sessionCsvPath, int maxRows = MaxSortedExportRows)
+    {
+        // +1 for the header
+        return CsvReport.CountRecords(sessionCsvPath, stopAfter: (long)maxRows + 1) <= (long)maxRows + 1;
+    }
+
+    /// <summary>
     /// Writes a standard CSV (header + rows only). Run metadata goes to a sidecar "{file}.summary.txt"
     /// so that any CSV parser can read the report file itself.
     /// </summary>
@@ -67,7 +76,9 @@ public static class ReportExporter
             return false;
         }
 
-        var sorted = TryLoadSorted(CsvReport.ReadDifferences(sessionCsvPath), maxSortedRows);
+        var sorted = SessionCsvFitsSortLimit(sessionCsvPath, maxSortedRows)
+            ? TryLoadSorted(CsvReport.ReadDifferences(sessionCsvPath), maxSortedRows)
+            : null;
         if (sorted != null)
         {
             await ExportToCsvAsync(filePath, sorted, stats, SortedNote);

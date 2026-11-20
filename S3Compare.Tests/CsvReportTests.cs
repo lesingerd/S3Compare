@@ -92,6 +92,30 @@ public class CsvReportTests
     }
 
     [Fact]
+    public async Task CountRecords_HandlesQuotedNewlines_AndStopsEarly()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "S3CompareTests_" + Guid.NewGuid().ToString("N") + ".csv");
+        try
+        {
+            var diffs = Enumerable.Range(1, 50).Select(i => new ObjectDifference
+            {
+                Id = i, Key = $"k{i}", Type = DifferenceType.MissingInBucketB, Details = "multi\nline \"quoted\", text"
+            }).ToList();
+            await ReportExporter.ExportToCsvAsync(path, diffs, new ComparisonStatistics());
+
+            Assert.Equal(51, CsvReport.CountRecords(path));
+            Assert.Equal(11, CsvReport.CountRecords(path, stopAfter: 10));
+            Assert.True(ReportExporter.SessionCsvFitsSortLimit(path, 50));
+            Assert.False(ReportExporter.SessionCsvFitsSortLimit(path, 49));
+        }
+        finally
+        {
+            foreach (var p in new[] { path, path + ".summary.txt" })
+                if (File.Exists(p)) File.Delete(p);
+        }
+    }
+
+    [Fact]
     public async Task ExportFromSessionCsv_SortsBoundedReports_AndCopiesLargeOnesInDiscoveryOrder()
     {
         string session = Path.Combine(Path.GetTempPath(), "S3CompareTests_" + Guid.NewGuid().ToString("N") + ".csv");
