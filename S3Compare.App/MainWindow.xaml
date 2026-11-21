@@ -655,6 +655,62 @@
                             </StackPanel>
                         </Grid>
                     </Border>
+
+                    <!-- PERFORMANCE / THROTTLING (COLLAPSIBLE) -->
+                    <Expander x:Name="PerformanceExpander" Margin="0,4,0,0" IsExpanded="False" Foreground="#94A3B8"
+                              ToolTip="Parallel scan and throttling settings. They change speed and request volume, never which differences are found.">
+                        <Expander.Header>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="🚀 Performance / Throttling" FontWeight="SemiBold" FontSize="12" Foreground="#94A3B8"/>
+                                <TextBlock FontSize="11" Foreground="#64748B" Margin="8,1,0,0">
+                                    <TextBlock.Text>
+                                        <MultiBinding StringFormat="{}({0} partitions, {1} pages prefetch, {2} LIST/s per bucket; 0 = unlimited)">
+                                            <Binding Path="MaxParallelPartitions"/>
+                                            <Binding Path="PrefetchPages"/>
+                                            <Binding Path="MaxListRequestsPerSecond"/>
+                                        </MultiBinding>
+                                    </TextBlock.Text>
+                                </TextBlock>
+                            </StackPanel>
+                        </Expander.Header>
+                        <Border Background="#1E293B" CornerRadius="6" Padding="8,5" Margin="0,4,0,0" BorderBrush="#334155" BorderThickness="1">
+                            <WrapPanel Orientation="Horizontal">
+                                <WrapPanel.Resources>
+                                    <Style TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+                                        <Setter Property="Width" Value="64"/>
+                                        <Setter Property="FontSize" Value="11"/>
+                                        <Setter Property="Padding" Value="3,1"/>
+                                        <Setter Property="Margin" Value="0,2,14,2"/>
+                                        <Setter Property="IsEnabled" Value="{Binding CanEditConfig}"/>
+                                    </Style>
+                                </WrapPanel.Resources>
+
+                                <TextBlock Text="Parallel partitions:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding MaxParallelPartitions, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="MaxParallelPartitions (default 8, 1-256): key ranges compared at the same time. The keyspace is split into about 4x this many ranges. 1 = single range (still prefetching). Throughput is roughly partitions x 1000 / page latency."/>
+
+                                <TextBlock Text="Prefetch pages:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding PrefetchPages, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="PrefetchPages (default 2, 1-64): 1000-key pages listed ahead of the comparison per bucket and partition. The next page is requested as soon as the previous one arrives. Partitions x prefetch pages must be at most 512 (bounds memory)."/>
+
+                                <TextBlock Text="Max LIST req/s per bucket:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding MaxListRequestsPerSecond, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="MaxListRequestsPerSecond (default 20, 0 = unlimited): requests per second per bucket, shared by all partitions (also counts planning and Full Data downloads). Caps listing at about this x 1000 objects/s per bucket. LIST requests are billed per 1,000 by AWS."/>
+
+                                <TextBlock Text="Max objects/s:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding MaxObjectsPerSecond, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="MaxObjectsPerSecond (default 0 = unlimited): cap on keys compared per second across all partitions. A key found in both buckets counts once."/>
+
+                                <TextBlock Text="Content checks:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding MaxConcurrentContentChecks, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="MaxConcurrentContentChecks (default 8, 1-256): Full Data mode only. Object pairs downloaded at the same time, across all partitions."/>
+
+                                <TextBlock Text="Discovery requests:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding MaxDiscoveryRequests, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="MaxDiscoveryRequests (default 500, 0-100000): LIST requests (both buckets together) the partition planner may spend finding range boundaries before the scan starts. 0 = no planning (one range)."/>
+                            </WrapPanel>
+                        </Border>
+                    </Expander>
                 </StackPanel>
 
                 <!-- LIVE DUAL MONITORS HEADER & TOGGLE -->
@@ -833,6 +889,7 @@
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
 
                     <Border Grid.Column="0" Background="#0F172A" CornerRadius="4" Padding="6,3" Margin="0,0,4,0" BorderBrush="#334155" BorderThickness="1">
@@ -888,7 +945,21 @@
                         </StackPanel>
                     </Border>
 
-                    <Border Grid.Column="7" Background="#0F172A" CornerRadius="4" Padding="6,3" BorderBrush="#334155" BorderThickness="1">
+                    <Border Grid.Column="7" Background="#0F172A" CornerRadius="4" Padding="6,3" Margin="0,0,4,0" BorderBrush="#334155" BorderThickness="1"
+                            ToolTip="Key-range partitions completed / total (active workers)">
+                        <StackPanel>
+                            <TextBlock Text="Partitions" FontSize="10" Foreground="#94A3B8"/>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="{Binding Statistics.PartitionsCompleted, StringFormat={}{0:N0}}" FontSize="15" FontWeight="Bold" Foreground="#2DD4BF"/>
+                                <TextBlock Text="/" FontSize="13" Foreground="#64748B" Margin="3,0"/>
+                                <TextBlock Text="{Binding Statistics.PartitionsTotal, StringFormat={}{0:N0}}" FontSize="15" FontWeight="Bold" Foreground="#2DD4BF"/>
+                                <TextBlock Text="{Binding Statistics.ActivePartitions, StringFormat={} ({0} active)}" FontSize="10" Foreground="#64748B" Margin="3,4,0,0"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Column="8" Background="#0F172A" CornerRadius="4" Padding="6,3" BorderBrush="#334155" BorderThickness="1"
+                            ToolTip="Aggregate objects compared per second across all partitions">
                         <StackPanel>
                             <TextBlock Text="Rate / Time / RAM" FontSize="10" Foreground="#94A3B8"/>
                             <StackPanel Orientation="Horizontal">

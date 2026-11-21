@@ -18,4 +18,8 @@
     <PackageReference Include="AWSSDK.S3" Version="4.0.104.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="S3Compare.Tests" />
+  </ItemGroup>
+
 </Project>

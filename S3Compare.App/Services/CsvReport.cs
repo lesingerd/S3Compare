@@ -111,6 +111,46 @@ public static class CsvReport
         }
     }
 
+    /// <summary>
+    /// Counts CSV records (including the header) without parsing fields or allocating per row, stopping as soon as
+    /// <paramref name="stopAfter"/> is exceeded. Newlines inside quoted fields are not record breaks.
+    /// </summary>
+    public static long CountRecords(string path, long stopAfter = long.MaxValue)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16);
+        using var reader = new StreamReader(stream, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: true);
+
+        var buffer = new char[1 << 16];
+        long records = 0;
+        bool inQuotes = false;
+        bool lineHasContent = false;
+        int read;
+        while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            for (int i = 0; i < read; i++)
+            {
+                char c = buffer[i];
+                if (c == '"')
+                {
+                    // An escaped quote ("") toggles twice, which leaves the state unchanged
+                    inQuotes = !inQuotes;
+                    lineHasContent = true;
+                }
+                else if (c == '\n' && !inQuotes)
+                {
+                    if (lineHasContent && ++records > stopAfter) return records;
+                    lineHasContent = false;
+                }
+                else if (c != '\r')
+                {
+                    lineHasContent = true;
+                }
+            }
+        }
+        if (lineHasContent) records++;
+        return records;
+    }
+
     /// <summary>Reads differences back from a CSV produced with <see cref="Header"/> and <see cref="BuildLine"/>.</summary>
     public static IEnumerable<ObjectDifference> ReadDifferences(string path)
     {
