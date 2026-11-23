@@ -86,6 +86,22 @@ public class BucketComparisonEngine
     private long _lastPageEventA;
     private long _lastPageEventB;
 
+    // Diagnostics
+    private readonly InFlightOperations _inFlight = new();
+    private readonly ListMetrics _metricsA = new();
+    private readonly ListMetrics _metricsB = new();
+    private volatile PlannerProgress? _plannerProgress;
+    private volatile string _latestStep = "-";
+    private volatile string _lastEngineError = "-";
+    private volatile ScanDiagnosticsLogger? _diag;
+    private readonly ConcurrentDictionary<int, byte> _runningRanges = new();
+    private long[] _rangeObjects = Array.Empty<long>();
+    private long _lastHeartbeatLogMs;
+
+    // Abandon support: the writer applies a batch under _writerGate; once abandoned it applies nothing more
+    private readonly SemaphoreSlim _writerGate = new(1, 1);
+    private volatile bool _abandoned;
+
     public event Action<ComparisonStatistics>? ProgressUpdated;
     public event Action<ObjectDifference>? DifferenceFound;
     public event Action<List<S3ObjectSummary>>? PageLoadedA;
@@ -108,6 +124,9 @@ public class BucketComparisonEngine
 
     /// <summary>Test hook: runs on the writer before each commit batch (1-based number); throwing simulates a disk failure.</summary>
     internal Action<int>? BeforeWriterBatch { get; set; }
+
+    /// <summary>Test hook: awaited (ignoring cancellation) after the workers finish, simulating a hang while finalizing.</summary>
+    internal Func<Task>? FinalizeHook { get; set; }
 
     /// <summary>The partition plan of the current (or last) run, with progress. Snapshot copy.</summary>
     public IReadOnlyList<ScanPartition> CurrentPlan => _ranges.Select(r => r.Clone()).ToList();
@@ -250,6 +269,7 @@ public class BucketComparisonEngine
             _pauseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             _pauseWatch.Start();
         }
+        RaiseProgress();
     }
 
     public void Resume()
@@ -263,6 +283,7 @@ public class BucketComparisonEngine
             _pauseWatch.Stop();
         }
         gate.TrySetResult();
+        RaiseProgress();
     }
 
     public bool IsPaused => _pauseGate != null;
@@ -288,7 +309,14 @@ public class BucketComparisonEngine
         Channel<CommitBatch>? commits = null;
         Task? writerTask = null;
         bool completed = false;
+        using var heartbeatCts = new CancellationTokenSource();
+        Task? heartbeatTask = null;
 
+        _abandoned = false;
+        _phase = "Starting";
+        _plannerProgress = null;
+        _lastEngineError = "-";
+        SetStep("Opening the live CSV report");
         await OpenLiveCsvAsync().ConfigureAwait(false);
 
         try
@@ -302,21 +330,38 @@ public class BucketComparisonEngine
 
                 if (listerA == null)
                 {
-                    // Every partition keeps one LIST in flight per bucket, plus content downloads
+                    SetStep("Creating the S3 clients");
+                    // Every partition keeps one LIST in flight per bucket, plus content downloads. The clients do not retry
+                    // by themselves (MaxErrorRetry 0): LIST retries are done, visibly, by AmazonS3Lister and content
+                    // downloads by the engine (ContentCheckAttempts).
                     int connections = _options.RequiredConnectionsPerServer + 4;
-                    _clientA = S3ClientFactory.CreateClient(_configA!, connections);
-                    _clientB = S3ClientFactory.CreateClient(_configB!, connections);
+                    _clientA = S3ClientFactory.CreateClient(_configA!, connections, maxErrorRetry: 0);
+                    _clientB = S3ClientFactory.CreateClient(_configB!, connections, maxErrorRetry: 0);
                     listerA = new AmazonS3Lister(_clientA);
                     listerB = new AmazonS3Lister(_clientB);
-
-                    diagnosticsLogger = new ScanDiagnosticsLogger();
-                    diagnosticsLogger.LogSessionConfig(_configA!, _configB!, _mode, _resumeCheckpoint == null ? null : "resume " + _resumeCheckpoint.DescribeProgress());
                 }
+
+                if (listerA == null || DiagnosticsLogDirectory != null)
+                {
+                    diagnosticsLogger = new ScanDiagnosticsLogger(DiagnosticsLogDirectory);
+                    _diag = diagnosticsLogger;
+                    diagnosticsLogger.LogSessionConfig(_configA!, _configB!, _mode, _resumeCheckpoint == null ? null : "resume " + _resumeCheckpoint.DescribeProgress());
+                    diagnosticsLogger.Log($"Step: {_latestStep}");
+                }
+
+                // Every request, from the planner and the scan, is metered, tracked while in flight and cancellable
+                listerA = new MeteredLister(listerA!, "A", _metricsA, _inFlight);
+                listerB = new MeteredLister(listerB!, "B", _metricsB, _inFlight);
             }
 
+            heartbeatTask = Task.Run(() => RunHeartbeatAsync(heartbeatCts.Token));
+
             _phase = "Planning";
+            SetStep("Planning key-range partitions");
             RaiseProgress();
             _ranges = await BuildPlanAsync(listerA, listerB, scanCts.Token).ConfigureAwait(false);
+            _rangeObjects = new long[_ranges.Count];
+            SetStep($"Plan ready: {_ranges.Count:N0} range(s), {_ranges.Count(r => r.Completed):N0} already complete");
 
             if (diagnosticsLogger != null)
             {
@@ -336,6 +381,7 @@ public class BucketComparisonEngine
             writerTask = Task.Run(() => RunWriterAsync(commitChannel, diagnosticsLogger, scanCts));
 
             _phase = "Scanning";
+            SetStep($"Scanning: starting up to {_options.MaxParallelPartitions} worker(s)");
             var pending = new ConcurrentQueue<int>(Enumerable.Range(0, _ranges.Count).Where(i => !_ranges[i].Completed));
             var plan = _ranges.Select(r => r.Clone()).ToArray();
             int workerCount = Math.Min(_options.MaxParallelPartitions, pending.Count);
@@ -357,6 +403,8 @@ public class BucketComparisonEngine
                         catch (Exception ex) when (ex is not OperationCanceledException || !scanCts.IsCancellationRequested)
                         {
                             // A real failure in one range stops the whole scan
+                            _lastEngineError = $"[{DateTime.Now:HH:mm:ss}] range {index}: {ex.GetType().Name}: {ex.Message}";
+                            diagnosticsLogger?.Log($"Worker failed on range {index}: {ex.GetType().Name}: {ex.Message}");
                             Interlocked.CompareExchange(ref firstError, ex, null);
                             try { scanCts.Cancel(); } catch (ObjectDisposedException) { }
                             return;
@@ -381,6 +429,9 @@ public class BucketComparisonEngine
                 // Stopped: every worker has committed the keys it fully processed
             }
 
+            _phase = "Finalizing";
+            SetStep("Finalizing: all workers finished, draining the writer");
+            if (FinalizeHook != null) await FinalizeHook().ConfigureAwait(false);
             commits.Writer.TryComplete();
             await writerTask.ConfigureAwait(false);
             writerTask = null;
@@ -390,8 +441,9 @@ public class BucketComparisonEngine
             if (_writerError != null) ExceptionDispatchInfo.Capture(_writerError).Throw();
             if (firstError != null) ExceptionDispatchInfo.Capture(firstError).Throw();
 
+            SetStep("Finalizing: scan complete, removing the checkpoint");
             _phase = "Completed";
-            if (CanCheckpoint)
+            if (CanCheckpoint && !_abandoned)
             {
                 CheckpointManager.DeleteCheckpoint(CreateCheckpointSnapshot(), CheckpointBaseDirectory);
             }
@@ -430,6 +482,12 @@ public class BucketComparisonEngine
                 }
             }
 
+            heartbeatCts.Cancel();
+            if (heartbeatTask != null)
+            {
+                try { await heartbeatTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            }
+
             _stopwatch.Stop();
             lock (_pauseLock)
             {
@@ -440,9 +498,11 @@ public class BucketComparisonEngine
             if (!completed)
             {
                 _phase = cancellationToken.IsCancellationRequested ? "Stopped" : "Failed";
-                await SaveCheckpointIfNeededAsync(diagnosticsLogger).ConfigureAwait(false);
+                SetStep(_abandoned ? "Stopped (engine was abandoned by the stop watchdog)" : $"{_phase}: saving the final checkpoint");
+                if (!_abandoned) await SaveCheckpointIfNeededAsync(diagnosticsLogger).ConfigureAwait(false);
             }
 
+            SetStep(_phase == "Completed" ? "Completed" : $"{_phase}: engine finished");
             RaiseProgress();
 
             if (_csvWriter != null)
@@ -560,14 +620,117 @@ public class BucketComparisonEngine
 
     private Task<List<ScanPartition>> PlanWithPlannerAsync(IS3Lister listerA, IS3Lister listerB, string? afterRelativeKey, CancellationToken cancellationToken)
     {
+        var plannerOptions = new PlannerOptions
+        {
+            MaxDuration = TimeSpan.FromSeconds(_options.MaxPlanningSeconds),
+            OnProgress = progress =>
+            {
+                _plannerProgress = progress;
+                if (!progress.Finished) _latestStep = $"Planning: {progress.Step}";
+                RaiseProgress();
+            },
+            Log = message => _diag?.Log(message)
+        };
+
         return PartitionPlanner.PlanAsync(
-            new PlannerBucket(listerA, _configA!.BucketName, _prefixA, _limiterA),
-            new PlannerBucket(listerB, _configB!.BucketName, _prefixB, _limiterB),
+            new PlannerBucket(listerA, _configA!.BucketName, _prefixA, _limiterA, "A"),
+            new PlannerBucket(listerB, _configB!.BucketName, _prefixB, _limiterB, "B"),
             _options.TargetPartitions,
             _options.MaxDiscoveryRequests,
             cancellationToken,
             afterRelativeKey,
-            WaitWhilePausedAsync);
+            WaitWhilePausedAsync,
+            plannerOptions);
+    }
+
+    /// <summary>Directory for the diagnostics log. When set, a log is written even with injected listers. Intended for tests.</summary>
+    public string? DiagnosticsLogDirectory { get; set; }
+
+    /// <summary>Records the latest engine phase step: shown in the UI and written to the diagnostics log.</summary>
+    private void SetStep(string step)
+    {
+        _latestStep = step;
+        _diag?.Log($"Step: {step}");
+    }
+
+    /// <summary>Every second: refreshes the UI (elapsed time, latency, in-flight ages) even when no batch arrives, and logs a diagnostics block every 10 s.</summary>
+    private async Task RunHeartbeatAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+                var stats = CloneStats();
+                SafeRaise(ProgressUpdated, stats);
+
+                long now = Environment.TickCount64;
+                if (_diag != null && now - Interlocked.Read(ref _lastHeartbeatLogMs) >= 10_000)
+                {
+                    Interlocked.Exchange(ref _lastHeartbeatLogMs, now);
+                    _diag.LogBlock("periodic", DiagnosticsFormatter.Format(stats));
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Last resort when <see cref="RunAsync"/> does not return after its token was cancelled (a request or a disk write that
+    /// ignores cancellation): logs what is stuck, saves the checkpoint that is consistent with the live CSV, and from then on
+    /// stops the engine from writing CSV rows, raising difference events or saving or deleting checkpoints. The abandoned
+    /// RunAsync task may still finish later; it has no further effect. Safe to call more than once.
+    /// </summary>
+    /// <returns>The checkpoint file path, or null when none could be saved.</returns>
+    public async Task<string?> AbandonAsync(string reason, TimeSpan? gateTimeout = null)
+    {
+        var stuck = _inFlight.Snapshot();
+        if (_diag != null)
+        {
+            _diag.Log($"ABANDON requested: {reason}. Phase {_phase}, step '{_latestStep}'. {stuck.Count} operation(s) in flight:");
+            foreach (var op in stuck) _diag.Log($"  stuck: {op}");
+            _diag.LogBlock("at abandon", DiagnosticsFormatter.Format(CloneStats(), includePartitions: true));
+        }
+
+        // Wait for the writer to finish its current batch (it applies batches under the gate), then freeze it
+        bool gotGate = await _writerGate.WaitAsync(gateTimeout ?? TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        bool alreadyAbandoned = _abandoned;
+        _abandoned = true;
+        string? path = null;
+        try
+        {
+            if (gotGate && !alreadyAbandoned && CanCheckpoint && !_checkpointUnsafe && _ranges.Any(r => r.Completed || r.LastCompletedKey != null))
+            {
+                try
+                {
+                    if (_csvWriter != null) await _csvWriter.FlushAsync().ConfigureAwait(false);
+                    var cp = CreateCheckpointSnapshot();
+                    path = await CheckpointManager.SaveCheckpointAsync(cp, CheckpointBaseDirectory).ConfigureAwait(false);
+                    _lastCheckpointDisplay = cp.DescribeProgress();
+                    _lastCheckpointTime = DateTime.Now;
+                    _diag?.Log($"ABANDON: checkpoint saved ({_lastCheckpointDisplay}) -> {Path.GetFileName(path)}");
+                }
+                catch (Exception ex)
+                {
+                    _diag?.Log($"ABANDON: could not save a checkpoint: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            else if (!gotGate)
+            {
+                _diag?.Log("ABANDON: the writer is stuck inside a batch (disk?); no new checkpoint written, the last periodic one stays valid.");
+            }
+        }
+        finally
+        {
+            if (gotGate) _writerGate.Release();
+        }
+
+        SetStep("Abandoned: the engine did not stop in time; it can no longer write results");
+        _phase = "Stopped";
+        RaiseProgress();
+        return path;
     }
 
     /// <summary>Waits while the scan is paused (used between planner requests).</summary>
@@ -620,6 +783,7 @@ public class BucketComparisonEngine
         CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _activePartitions);
+        _runningRanges[rangeIndex] = 0;
         var work = new RangeWork(rangeIndex, range.LastCompletedKey);
         IS3ObjectStream? enumA = null;
         IS3ObjectStream? enumB = null;
@@ -735,6 +899,7 @@ public class BucketComparisonEngine
                 if (enumB != null) await enumB.DisposeAsync().ConfigureAwait(false);
             }
             Interlocked.Decrement(ref _activePartitions);
+            _runningRanges.TryRemove(rangeIndex, out _);
         }
     }
 
@@ -823,27 +988,41 @@ public class BucketComparisonEngine
             int batchNumber = 0;
             await foreach (var batch in commits.Reader.ReadAllAsync().ConfigureAwait(false))
             {
-                BeforeWriterBatch?.Invoke(++batchNumber);
-
-                if (batch.Differences != null)
+                // A batch is applied as a unit under the gate, so AbandonAsync can take a consistent checkpoint between batches
+                await _writerGate.WaitAsync().ConfigureAwait(false);
+                try
                 {
-                    foreach (var diff in batch.Differences)
+                    if (_abandoned) continue; // abandoned: nothing may be written any more
+
+                    BeforeWriterBatch?.Invoke(++batchNumber);
+                    if (_abandoned) continue; // abandoned while the hook (or a stalled disk) held this batch
+
+                    if (batch.Differences != null)
                     {
-                        SafeRaise(DifferenceFound, diff);
-                        if (_csvWriter != null)
+                        using var csvOp = _inFlight.Begin($"CSV writer: writing {batch.Differences.Count:N0} row(s) to the live report");
+                        foreach (var diff in batch.Differences)
                         {
-                            await _csvWriter.WriteLineAsync(CsvReport.BuildLine(diff)).ConfigureAwait(false);
+                            SafeRaise(DifferenceFound, diff);
+                            if (_csvWriter != null)
+                            {
+                                await _csvWriter.WriteLineAsync(CsvReport.BuildLine(diff)).ConfigureAwait(false);
+                            }
                         }
                     }
+
+                    _totals.Add(batch.Delta);
+                    var range = _ranges[batch.RangeIndex];
+                    if (batch.LastCompletedKey != null) range.LastCompletedKey = batch.LastCompletedKey;
+                    if (batch.Completed) range.Completed = true;
+                    if (batch.RangeIndex < _rangeObjects.Length) _rangeObjects[batch.RangeIndex] += batch.Delta.ObjectsCompared;
+                    _itemsSinceCheckpoint += batch.Delta.ObjectsCompared;
+
+                    await TickAsync(diagnosticsLogger).ConfigureAwait(false);
                 }
-
-                _totals.Add(batch.Delta);
-                var range = _ranges[batch.RangeIndex];
-                if (batch.LastCompletedKey != null) range.LastCompletedKey = batch.LastCompletedKey;
-                if (batch.Completed) range.Completed = true;
-                _itemsSinceCheckpoint += batch.Delta.ObjectsCompared;
-
-                await TickAsync(diagnosticsLogger).ConfigureAwait(false);
+                finally
+                {
+                    _writerGate.Release();
+                }
             }
         }
         catch (Exception ex)
@@ -892,7 +1071,7 @@ public class BucketComparisonEngine
 
     private async Task SaveCheckpointIfNeededAsync(ScanDiagnosticsLogger? diagnosticsLogger)
     {
-        if (!CanCheckpoint || _checkpointUnsafe || !_ranges.Any(r => r.Completed || r.LastCompletedKey != null))
+        if (!CanCheckpoint || _checkpointUnsafe || _abandoned || !_ranges.Any(r => r.Completed || r.LastCompletedKey != null))
             return;
 
         try
@@ -1037,9 +1216,12 @@ public class BucketComparisonEngine
                     await _limiterA.WaitIfLimitedAsync(1, cancellationToken).ConfigureAwait(false);
                     await _limiterB.WaitIfLimitedAsync(1, cancellationToken).ConfigureAwait(false);
 
-                    contentMatches = ContentComparer != null
-                        ? await ContentComparer(itemA, itemB, cancellationToken).ConfigureAwait(false)
-                        : await StreamCompareObjectsAsync(_clientA!, _clientB!, itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+                    // Stop must not wait for a download that ignores cancellation
+                    contentMatches = await AbandonableTask.WithCancellation(
+                        ContentComparer != null
+                            ? ContentComparer(itemA, itemB, cancellationToken)
+                            : StreamCompareObjectsAsync(_clientA!, _clientB!, itemA.Key, itemB.Key, cancellationToken),
+                        cancellationToken).ConfigureAwait(false);
                     break;
                 }
                 catch (Exception ex) when (IsPerObjectContentFailure(ex, cancellationToken))
@@ -1154,6 +1336,53 @@ public class BucketComparisonEngine
         return totalRead;
     }
 
+    private void FillRequestDiagnostics(ComparisonStatistics stats)
+    {
+        double waitA = _limiterA?.TotalWaitSeconds ?? 0;
+        double waitB = _limiterB?.TotalWaitSeconds ?? 0;
+        stats.BucketAList = _metricsA.Snapshot(waitA);
+        stats.BucketBList = _metricsB.Snapshot(waitB);
+        stats.TotalListRequests = stats.BucketAList.Requests + stats.BucketBList.Requests;
+        stats.RateLimiterWaitSeconds = waitA + waitB;
+
+        // Newest of: a worker/engine failure, the last failed LIST of either bucket, the planner's last failure
+        string error = _lastEngineError;
+        if (error == "-")
+        {
+            var a = stats.BucketAList;
+            var b = stats.BucketBList;
+            if (a.LastErrorAt != null && (b.LastErrorAt == null || a.LastErrorAt >= b.LastErrorAt))
+                error = $"[{a.LastErrorAt:HH:mm:ss}] A LIST: {a.LastError}";
+            else if (b.LastErrorAt != null)
+                error = $"[{b.LastErrorAt:HH:mm:ss}] B LIST: {b.LastError}";
+            else if (!string.IsNullOrEmpty(stats.Planner?.LastError))
+                error = stats.Planner!.LastError!;
+        }
+        stats.LastError = error;
+    }
+
+    /// <summary>Plan with per-range state, for the diagnostics table. Ranges are only mutated (never added), so reading them from another thread is safe enough for display.</summary>
+    private List<PartitionStatus> SnapshotPartitions()
+    {
+        var ranges = _ranges;
+        var objects = _rangeObjects;
+        var list = new List<PartitionStatus>(ranges.Count);
+        for (int i = 0; i < ranges.Count; i++)
+        {
+            var r = ranges[i];
+            list.Add(new PartitionStatus
+            {
+                Index = i,
+                Lower = r.Lower ?? "(start)",
+                Upper = r.Upper ?? "(end)",
+                State = r.Completed ? "Done" : _runningRanges.ContainsKey(i) ? "Running" : "Pending",
+                LastCompletedKey = r.LastCompletedKey ?? "-",
+                ObjectsCompared = i < objects.Length ? Interlocked.Read(ref objects[i]) : 0
+            });
+        }
+        return list;
+    }
+
     private ComparisonStatistics CloneStats()
     {
         double elapsedSeconds = TotalElapsedSeconds();
@@ -1171,9 +1400,15 @@ public class BucketComparisonEngine
             Phase = _phase,
             PartitionsTotal = _ranges.Count,
             PartitionsCompleted = _ranges.Count(r => r.Completed),
-            ActivePartitions = Volatile.Read(ref _activePartitions)
+            ActivePartitions = Volatile.Read(ref _activePartitions),
+            IsPaused = IsPaused,
+            LatestStep = _latestStep,
+            Planner = _plannerProgress,
+            InFlight = _inFlight.Snapshot(),
+            Partitions = SnapshotPartitions()
         };
         _totals.CopyTo(stats);
+        FillRequestDiagnostics(stats);
 
         if (_providedStreamA != null && _providedStreamB != null)
         {
