@@ -106,6 +106,8 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
    - **Planning is bounded and visible.** Independent planner requests (the folders of one level, a wave of probes) run concurrently, up to 8 per bucket, within the request budget and the rate limiter. Every planner request has a 15 s timeout and is abandoned even if the connection ignores cancellation; a failed or timed-out request is logged and skipped, never fatal. If a bucket rejects the delimiter listing it is switched to probes for the rest of the plan (logged once); probing is switched off for a bucket after 3 failures in a row. The planner only ever uses ordinary `StartAfter` values (the prefix plus a printable ASCII character), never a U+10FFFF-style sentinel. Only stopping the scan aborts planning. Progress is shown live (see [Seeing what a scan is doing](#seeing-what-a-scan-is-doing)).
    - The ranges always tile the keyspace exactly, so **planning quality only affects speed, never results**: a partitioned scan reports exactly the same differences and counts as a single-stream scan.
 
+All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles. Pausing also holds planning between requests.
+
 #### Seeing what a scan is doing
 
 The UI is built so that a screenshot is enough to diagnose a slow or stalled scan.
@@ -120,7 +122,7 @@ The UI is built so that a screenshot is enough to diagnose a slow or stalled sca
 
 **Timeouts and retries.** The SDK's own retries are turned off for the scan's clients (`MaxErrorRetry = 0`, HTTP timeout 30 s per attempt, so no more silent multi-minute stalls: the old settings, 45 s and 3 retries, let one hung request take about 3 minutes). `ListObjectsV2` calls are retried by S3Compare itself, up to 3 attempts of at most 30 s each with 1 s/2 s pauses, for timeouts, network errors, throttling and 5xx answers (not for access-denied or no-such-bucket); the attempt number is shown in the in-flight list. Full Data downloads keep their own 2-attempt retry. Connection tests and bucket discovery still use the SDK default (30 s, 2 retries).
 
-All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles. Pausing also holds planning between requests.
+#### Settings, sizing and cost
 
 | Setting | Default | Meaning |
 |---|---|---|
