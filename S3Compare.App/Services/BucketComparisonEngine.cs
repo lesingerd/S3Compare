@@ -92,7 +92,7 @@ public class BucketComparisonEngine
     private readonly ListMetrics _metricsB = new();
     private volatile PlannerProgress? _plannerProgress;
     private volatile string _latestStep = "-";
-    private volatile string _lastEngineError = "-";
+    private readonly IssueLog _issues = new();
     private volatile ScanDiagnosticsLogger? _diag;
     private readonly ConcurrentDictionary<int, byte> _runningRanges = new();
     private long[] _rangeObjects = Array.Empty<long>();
@@ -315,7 +315,8 @@ public class BucketComparisonEngine
         _abandoned = false;
         _phase = "Starting";
         _plannerProgress = null;
-        _lastEngineError = "-";
+        _issues.Clear();
+        _issues.Added = LogIssue;
         SetStep("Opening the live CSV report");
         await OpenLiveCsvAsync().ConfigureAwait(false);
 
@@ -350,8 +351,8 @@ public class BucketComparisonEngine
                 }
 
                 // Every request, from the planner and the scan, is metered, tracked while in flight and cancellable
-                listerA = new MeteredLister(listerA!, "A", _metricsA, _inFlight);
-                listerB = new MeteredLister(listerB!, "B", _metricsB, _inFlight);
+                listerA = new MeteredLister(listerA!, "A", _metricsA, _inFlight, _issues);
+                listerB = new MeteredLister(listerB!, "B", _metricsB, _inFlight, _issues);
             }
 
             heartbeatTask = Task.Run(() => RunHeartbeatAsync(heartbeatCts.Token));
@@ -403,7 +404,7 @@ public class BucketComparisonEngine
                         catch (Exception ex) when (ex is not OperationCanceledException || !scanCts.IsCancellationRequested)
                         {
                             // A real failure in one range stops the whole scan
-                            _lastEngineError = $"[{DateTime.Now:HH:mm:ss}] range {index}: {ex.GetType().Name}: {ex.Message}";
+                            if (_writerError == null) _issues.Add(IssueOutcome.Failed, $"range {index}: {ex.GetType().Name}: {ex.Message} \u2014 the scan was stopped; a checkpoint is kept so it can be resumed");
                             diagnosticsLogger?.Log($"Worker failed on range {index}: {ex.GetType().Name}: {ex.Message}");
                             Interlocked.CompareExchange(ref firstError, ex, null);
                             try { scanCts.Cancel(); } catch (ObjectDisposedException) { }
@@ -460,6 +461,8 @@ public class BucketComparisonEngine
         }
         catch (Exception ex)
         {
+            if (ex is not OperationCanceledException && !_issues.HasFailed)
+                _issues.Add(IssueOutcome.Failed, $"scan failed: {ex.GetType().Name}: {ex.Message} \u2014 the scan was stopped");
             if (diagnosticsLogger != null && ex is not OperationCanceledException)
             {
                 await diagnosticsLogger.LogErrorAsync("ScanExecution", ex).ConfigureAwait(false);
@@ -629,7 +632,8 @@ public class BucketComparisonEngine
                 if (!progress.Finished) _latestStep = $"Planning: {progress.Step}";
                 RaiseProgress();
             },
-            Log = message => _diag?.Log(message)
+            Log = message => _diag?.Log(message),
+            OnIssue = (outcome, detail) => _issues.Add(outcome, detail)
         };
 
         return PartitionPlanner.PlanAsync(
@@ -1028,6 +1032,7 @@ public class BucketComparisonEngine
         catch (Exception ex)
         {
             // e.g. the disk is full: the CSV no longer matches the ranges' progress, so stop and keep the last good checkpoint
+            _issues.Add(IssueOutcome.Failed, $"writer failed: {ex.GetType().Name}: {ex.Message} \u2014 the scan was stopped; the last good checkpoint is kept so it can be resumed");
             _writerError = ex;
             _checkpointUnsafe = true;
             commits.Writer.TryComplete(ex);
@@ -1205,6 +1210,7 @@ public class BucketComparisonEngine
         // Always download: single-part ETags are not MD5 content hashes for SSE-KMS/SSE-C objects,
         // so differing ETags alone do not prove the content differs.
         bool contentMatches;
+        Exception? firstFailure = null;
         await _contentChecks.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -1226,6 +1232,7 @@ public class BucketComparisonEngine
                 }
                 catch (Exception ex) when (IsPerObjectContentFailure(ex, cancellationToken))
                 {
+                    firstFailure ??= ex;
                     // Transport failures (reset connection, timeout, ...) get one more try; service errors are definitive
                     if (attempt < ContentCheckAttempts && ex is not AmazonServiceException) continue;
 
@@ -1234,6 +1241,7 @@ public class BucketComparisonEngine
                     string attempts = attempt > 1 ? $" (after {attempt} attempts)" : "";
                     work.KeyDiffs.Add(BuildPairDifference(itemA, itemB, relativeKey, DifferenceType.ContentCheckError,
                         $"Content could not be verified{attempts}: {reason}: {ex.Message}"));
+                    _issues.Add(IssueOutcome.Recorded, $"as Content Check Error for '{relativeKey}'; scan continued ({reason}{(attempt > 1 ? $", after {attempt} attempts" : "")})");
                     work.KeyCounters.ContentCheckErrorCount++;
                     work.KeyCounters.TotalDifferences++;
                     return;
@@ -1243,6 +1251,12 @@ public class BucketComparisonEngine
         finally
         {
             _contentChecks.Release();
+        }
+
+        if (firstFailure != null)
+        {
+            _issues.Add(IssueOutcome.Recovered,
+                $"content check of '{relativeKey}' succeeded on a retry — no impact (first attempt: {firstFailure.GetType().Name}: {firstFailure.Message})");
         }
 
         if (contentMatches)
@@ -1345,20 +1359,15 @@ public class BucketComparisonEngine
         stats.TotalListRequests = stats.BucketAList.Requests + stats.BucketBList.Requests;
         stats.RateLimiterWaitSeconds = waitA + waitB;
 
-        // Newest of: a worker/engine failure, the last failed LIST of either bucket, the planner's last failure
-        string error = _lastEngineError;
-        if (error == "-")
-        {
-            var a = stats.BucketAList;
-            var b = stats.BucketBList;
-            if (a.LastErrorAt != null && (b.LastErrorAt == null || a.LastErrorAt >= b.LastErrorAt))
-                error = $"[{a.LastErrorAt:HH:mm:ss}] A LIST: {a.LastError}";
-            else if (b.LastErrorAt != null)
-                error = $"[{b.LastErrorAt:HH:mm:ss}] B LIST: {b.LastError}";
-            else if (!string.IsNullOrEmpty(stats.Planner?.LastError))
-                error = stats.Planner!.LastError!;
-        }
-        stats.LastError = error;
+        stats.Issues = _issues.Snapshot();
+    }
+
+    /// <summary>Writes a classified issue to the diagnostics log (same wording as the UI). A flood of identical outcomes is thinned out; the counts stay exact.</summary>
+    private void LogIssue(IssueEntry entry, int countOfOutcome)
+    {
+        bool important = entry.Outcome is IssueOutcome.Failed or IssueOutcome.Degraded;
+        if (important || countOfOutcome <= 50 || countOfOutcome % 25 == 0)
+            _diag?.Log($"Issue: {entry.Display}");
     }
 
     /// <summary>Plan with per-range state, for the diagnostics table. Ranges are only mutated (never added), so reading them from another thread is safe enough for display.</summary>

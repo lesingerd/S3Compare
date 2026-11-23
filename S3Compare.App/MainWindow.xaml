@@ -25,6 +25,7 @@
         <BooleanToVisibilityConverter x:Key="BoolToVisConverter"/>
         <conv:InverseBooleanConverter x:Key="InverseBoolConverter"/>
         <conv:DifferenceTypeToBrushConverter x:Key="DiffTypeBrushConverter"/>
+        <conv:IssueOutcomeToBrushConverter x:Key="IssueBrushConverter"/>
 
         <!-- Styles -->
         <Style TargetType="TextBlock">
@@ -1006,7 +1007,7 @@
 
                 <!-- SCAN DIAGNOSTICS (screenshot-friendly) -->
                 <Expander Grid.Row="2" Margin="0,0,0,6" IsExpanded="{Binding IsDiagnosticsExpanded, Mode=TwoWay}" Foreground="#94A3B8"
-                          ToolTip="Phase, planner progress, per-bucket LIST latency and rate, in-flight requests, partitions and the last error. The same text is written to the diagnostics log.">
+                          ToolTip="Phase, planner progress, per-bucket LIST latency and rate, in-flight requests, partitions and the issues (each with its outcome: only FAILED stops anything). The same text is written to the diagnostics log.">
                     <Expander.Header>
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="Scan Diagnostics" FontWeight="SemiBold" FontSize="12" Foreground="#94A3B8"/>
@@ -1021,7 +1022,20 @@
                         </Grid.ColumnDefinitions>
                         <Border Grid.Column="0" Background="#0F172A" CornerRadius="4" Padding="8,6" BorderBrush="#334155" BorderThickness="1">
                             <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
-                                <TextBlock Text="{Binding DiagnosticsText}" FontFamily="Consolas" FontSize="11" Foreground="#E2E8F0" TextWrapping="NoWrap"/>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding DiagnosticsText}" FontFamily="Consolas" FontSize="11" Foreground="#E2E8F0" TextWrapping="NoWrap"/>
+                                    <TextBlock Text="{Binding IssueLineText}" FontFamily="Consolas" FontSize="11" FontWeight="SemiBold" Foreground="{Binding IssueBrush}" Margin="0,6,0,0"/>
+                                    <TextBlock Text="{Binding MostSevereText}" FontFamily="Consolas" FontSize="11" Foreground="{Binding IssueBrush}"/>
+                                    <TextBlock Text="Recent issues (newest first):" FontFamily="Consolas" FontSize="11" Foreground="#94A3B8" Margin="0,2,0,0"/>
+                                    <ItemsControl ItemsSource="{Binding RecentIssues}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding Display}" FontFamily="Consolas" FontSize="11" Margin="8,0,0,0" TextWrapping="NoWrap"
+                                                           Foreground="{Binding Outcome, Converter={StaticResource IssueBrushConverter}}"/>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
                             </ScrollViewer>
                         </Border>
                         <DataGrid Grid.Column="2" ItemsSource="{Binding PartitionRows}" AutoGenerateColumns="False" IsReadOnly="True"
@@ -1095,10 +1109,13 @@
             <DockPanel>
                 <TextBlock DockPanel.Dock="Right" Text="Wasabi S3 Compare Tool | Zero-Disk-Persistence" 
                            Foreground="#64748B" FontSize="11" VerticalAlignment="Center"/>
+                <TextBlock DockPanel.Dock="Right" Text="{Binding IssueStatusText}" Foreground="{Binding IssueBrush}" FontSize="11" FontWeight="SemiBold"
+                           Margin="0,0,12,0" VerticalAlignment="Center" MaxWidth="760" TextTrimming="CharacterEllipsis" ToolTip="{Binding IssueStatusText}"
+                           Visibility="{Binding HasIssues, Converter={StaticResource BoolToVisConverter}}"/>
                 <Border DockPanel.Dock="Left" Background="#334155" CornerRadius="3" Padding="6,1" Margin="0,0,8,0" VerticalAlignment="Center">
                     <TextBlock Text="{Binding PhaseText}" Foreground="#F8FAFC" FontSize="11" FontWeight="Bold"/>
                 </Border>
-                <TextBlock Text="{Binding StatusMessage}" Foreground="#38BDF8" FontSize="12" FontWeight="SemiBold"
+                <TextBlock Text="{Binding StatusMessage}" Foreground="{Binding StatusBrush}" FontSize="12" FontWeight="SemiBold"
                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip="{Binding StatusMessage}"/>
             </DockPanel>
         </Border>

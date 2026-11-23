@@ -158,7 +158,7 @@ public class ComparisonStatistics
     public ListRequestStats BucketBList { get; set; } = new();
     public long TotalListRequests { get; set; }
     public double RateLimiterWaitSeconds { get; set; }
-    public string LastError { get; set; } = "-";
+    public IssueSummary Issues { get; set; } = IssueSummary.Empty;
     public List<PartitionStatus> Partitions { get; set; } = new();
     public List<InFlightOperationInfo> InFlight { get; set; } = new();
 }
@@ -200,7 +200,7 @@ public sealed class PlannerProgress
             string budget = RequestBudget > 0 ? $"{RequestsUsed:N0}/{RequestBudget:N0}" : $"{RequestsUsed:N0}";
             string limit = TimeLimit > TimeSpan.Zero ? $" of {TimeLimit.TotalSeconds:N0}s" : string.Empty;
             string text = $"{Step} | requests {budget} | candidates {Candidates:N0} | {Elapsed.TotalSeconds:N0}s{limit}";
-            if (FailedRequests > 0) text += $" | failed {FailedRequests:N0}";
+            if (FailedRequests > 0) text += $" | {FailedRequests:N0} request(s) skipped";
             if (TimedOut) text += " | TIME LIMIT REACHED";
             return text;
         }
@@ -211,7 +211,12 @@ public sealed class PlannerProgress
 public sealed class ListRequestStats
 {
     public long Requests { get; init; }
+    /// <summary>Calls that failed for good (after all attempts).</summary>
     public long Failures { get; init; }
+    /// <summary>Calls that needed more than one attempt.</summary>
+    public long Retried { get; init; }
+    /// <summary>Retried calls that then succeeded.</summary>
+    public long Recovered { get; init; }
     public double AverageLatencyMs { get; init; }
     public double LastLatencyMs { get; init; }
     public double RequestsPerSecond { get; init; }
