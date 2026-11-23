@@ -8,6 +8,8 @@ public class ScanDiagnosticsLogger : IAsyncDisposable
 {
     private readonly string _logFilePath;
     private readonly StreamWriter _writer;
+    private readonly object _sync = new();
+    private bool _disposed;
     private readonly Stopwatch _stopwatch = new();
     private long _lastFlushTime = 0;
 
@@ -61,7 +63,7 @@ public class ScanDiagnosticsLogger : IAsyncDisposable
         _writer.Flush();
     }
 
-    public async Task LogHeartbeatAsync(
+    public Task LogHeartbeatAsync(
         long objectsCompared,
         double itemsPerSecond,
         string keyA,
@@ -73,7 +75,7 @@ public class ScanDiagnosticsLogger : IAsyncDisposable
         long now = _stopwatch.ElapsedMilliseconds;
         if (!forceFlush && now - _lastFlushTime < 5000)
         {
-            return;
+            return Task.CompletedTask;
         }
         _lastFlushTime = now;
 
@@ -85,29 +87,29 @@ public class ScanDiagnosticsLogger : IAsyncDisposable
         int gen2 = GC.CollectionCount(2);
 
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [HEARTBEAT] Evaluated: {objectsCompared:N0} ({itemsPerSecond:N0} obj/s) | Diffs: {totalDifferences:N0} | Elapsed: {elapsed:hh\\:mm\\:ss} | RAM WorkingSet: {workingSetMB:F1} MB, GC Total: {gcTotalMB:F1} MB (Gen0/1/2: {gen0}/{gen1}/{gen2}) | CurrentKeyA: '{Truncate(keyA, 60)}' | CurrentKeyB: '{Truncate(keyB, 60)}'";
-        await _writer.WriteLineAsync(line).ConfigureAwait(false);
-        await _writer.FlushAsync().ConfigureAwait(false);
+        WriteAndFlush(line);
+        return Task.CompletedTask;
     }
 
-    public async Task LogCheckpointAsync(string checkpointFile, string lastKey, long objectsCompared)
+    public Task LogCheckpointAsync(string checkpointFile, string lastKey, long objectsCompared)
     {
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [CHECKPOINT] Checkpoint saved at key '{lastKey}' (Total evaluated: {objectsCompared:N0}) -> {Path.GetFileName(checkpointFile)}";
-        await _writer.WriteLineAsync(line).ConfigureAwait(false);
-        await _writer.FlushAsync().ConfigureAwait(false);
+        WriteAndFlush(line);
+        return Task.CompletedTask;
     }
 
-    public async Task LogErrorAsync(string context, Exception ex)
+    public Task LogErrorAsync(string context, Exception ex)
     {
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [ERROR] [{context}] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}";
-        await _writer.WriteLineAsync(line).ConfigureAwait(false);
-        await _writer.FlushAsync().ConfigureAwait(false);
+        WriteAndFlush(line);
+        return Task.CompletedTask;
     }
 
-    public async Task LogInfoAsync(string message)
+    public Task LogInfoAsync(string message)
     {
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [INFO] {message}";
-        await _writer.WriteLineAsync(line).ConfigureAwait(false);
-        await _writer.FlushAsync().ConfigureAwait(false);
+        WriteAndFlush(line);
+        return Task.CompletedTask;
     }
 
     private static string Truncate(string val, int maxLen)
@@ -116,10 +118,38 @@ public class ScanDiagnosticsLogger : IAsyncDisposable
         return val.Length <= maxLen ? val : val.Substring(0, maxLen - 3) + "...";
     }
 
+    /// <summary>Thread-safe synchronous info line (planner and watchdog log from several threads).</summary>
+    public void Log(string message) => WriteAndFlush($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [INFO] {message}");
+
+    /// <summary>Multi-line block (e.g. the diagnostics panel text), written under one lock so it is never interleaved.</summary>
+    public void LogBlock(string title, string text)
+        => WriteAndFlush($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [DIAGNOSTICS] {title}\n{text}");
+
+    private void WriteAndFlush(string line)
+    {
+        lock (_sync)
+        {
+            if (_disposed) return;
+            try
+            {
+                _writer.WriteLine(line);
+                _writer.Flush();
+            }
+            catch (IOException)
+            {
+                // Logging must never break a scan
+            }
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
-        _writer.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [SHUTDOWN] Diagnostics logging finalized.");
-        await _writer.FlushAsync().ConfigureAwait(false);
+        WriteAndFlush($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [SHUTDOWN] Diagnostics logging finalized.");
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
         await _writer.DisposeAsync().ConfigureAwait(false);
     }
 }
