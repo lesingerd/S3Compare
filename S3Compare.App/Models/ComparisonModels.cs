@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Text.Json.Serialization;
 
 namespace S3Compare.App.Models;
@@ -148,6 +149,118 @@ public class ComparisonStatistics
     public int PartitionsTotal { get; set; }
     public int PartitionsCompleted { get; set; }
     public int ActivePartitions { get; set; }
+    public bool IsPaused { get; set; }
+
+    // Diagnostics (screenshot-friendly panel and log)
+    public string LatestStep { get; set; } = "-";
+    public PlannerProgress? Planner { get; set; }
+    public ListRequestStats BucketAList { get; set; } = new();
+    public ListRequestStats BucketBList { get; set; } = new();
+    public long TotalListRequests { get; set; }
+    public double RateLimiterWaitSeconds { get; set; }
+    public string LastError { get; set; } = "-";
+    public List<PartitionStatus> Partitions { get; set; } = new();
+    public List<InFlightOperationInfo> InFlight { get; set; } = new();
+}
+
+/// <summary>An S3 request or writer wait that has not finished yet.</summary>
+public sealed class InFlightOperationInfo
+{
+    public string Description { get; init; } = string.Empty;
+    public double AgeSeconds { get; init; }
+    public int Attempt { get; init; } = 1;
+
+    public override string ToString() => Attempt > 1
+        ? $"{Description} | age {AgeSeconds:N1}s | attempt {Attempt}"
+        : $"{Description} | age {AgeSeconds:N1}s";
+}
+
+/// <summary>Live state of the partition planner (the work done before the scan starts).</summary>
+public sealed class PlannerProgress
+{
+    /// <summary>What the planner is doing now, e.g. "A: delimiter depth 2/3 | B: probe round 4 (prefix depth 3)".</summary>
+    public string Step { get; init; } = "Starting";
+    public int RequestsUsed { get; init; }
+    public int RequestBudget { get; init; }
+    public int Candidates { get; init; }
+    public TimeSpan Elapsed { get; init; }
+    /// <summary>The time box (zero = unlimited).</summary>
+    public TimeSpan TimeLimit { get; init; }
+    public int FailedRequests { get; init; }
+    public string? LastError { get; init; }
+    public bool TimedOut { get; init; }
+    public bool Finished { get; init; }
+    /// <summary>Techniques switched off after failures, e.g. "A: delimiter listing".</summary>
+    public string DisabledTechniques { get; init; } = string.Empty;
+
+    public string Summary
+    {
+        get
+        {
+            string budget = RequestBudget > 0 ? $"{RequestsUsed:N0}/{RequestBudget:N0}" : $"{RequestsUsed:N0}";
+            string limit = TimeLimit > TimeSpan.Zero ? $" of {TimeLimit.TotalSeconds:N0}s" : string.Empty;
+            string text = $"{Step} | requests {budget} | candidates {Candidates:N0} | {Elapsed.TotalSeconds:N0}s{limit}";
+            if (FailedRequests > 0) text += $" | failed {FailedRequests:N0}";
+            if (TimedOut) text += " | TIME LIMIT REACHED";
+            return text;
+        }
+    }
+}
+
+/// <summary>LIST request statistics of one bucket (planning and scanning together).</summary>
+public sealed class ListRequestStats
+{
+    public long Requests { get; init; }
+    public long Failures { get; init; }
+    public double AverageLatencyMs { get; init; }
+    public double LastLatencyMs { get; init; }
+    public double RequestsPerSecond { get; init; }
+    public double RateLimiterWaitSeconds { get; init; }
+    public string? LastError { get; init; }
+    public DateTime? LastErrorAt { get; init; }
+}
+
+/// <summary>One key range of the plan as shown in the diagnostics table.</summary>
+public sealed class PartitionStatus : INotifyPropertyChanged
+{
+    private string _lower = string.Empty;
+    private string _upper = string.Empty;
+    private string _state = "Pending";
+    private string _lastCompletedKey = "-";
+    private long _objectsCompared;
+
+    public int Index { get; set; }
+    public string Lower { get => _lower; set => Set(ref _lower, value, nameof(Lower)); }
+    public string Upper { get => _upper; set => Set(ref _upper, value, nameof(Upper)); }
+    /// <summary>Pending, Running or Done.</summary>
+    public string State { get => _state; set => Set(ref _state, value, nameof(State)); }
+    public string LastCompletedKey { get => _lastCompletedKey; set => Set(ref _lastCompletedKey, value, nameof(LastCompletedKey)); }
+    /// <summary>Keys compared in this range during this run (not counting a run it was resumed from).</summary>
+    public long ObjectsCompared
+    {
+        get => _objectsCompared;
+        set { if (_objectsCompared != value) { _objectsCompared = value; Raise(nameof(ObjectsCompared)); } }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public void UpdateFrom(PartitionStatus other)
+    {
+        Lower = other.Lower;
+        Upper = other.Upper;
+        State = other.State;
+        LastCompletedKey = other.LastCompletedKey;
+        ObjectsCompared = other.ObjectsCompared;
+    }
+
+    private void Set(ref string field, string value, string name)
+    {
+        if (field == value) return;
+        field = value;
+        Raise(name);
+    }
+
+    private void Raise(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
 /// <summary>
@@ -177,6 +290,7 @@ public class ScanPerformanceOptions
     public const int DefaultMaxObjectsPerSecond = 0;
     public const int DefaultMaxConcurrentContentChecks = 8;
     public const int DefaultMaxDiscoveryRequests = 500;
+    public const int DefaultMaxPlanningSeconds = 60;
 
     /// <summary>
     /// Upper bound on MaxParallelPartitions x PrefetchPages. Each listing buffers up to PrefetchPages + 2 pages of 1,000
@@ -202,6 +316,12 @@ public class ScanPerformanceOptions
     /// <summary>Budget of LIST requests (both buckets together) the partition planner may spend.</summary>
     public int MaxDiscoveryRequests { get; set; } = DefaultMaxDiscoveryRequests;
 
+    /// <summary>
+    /// Time box for planning, in seconds (0 = unlimited). When exceeded the planner stops sending requests and builds ranges
+    /// from the boundaries found so far (still tiling the keyspace), so a slow endpoint cannot stall the scan start.
+    /// </summary>
+    public int MaxPlanningSeconds { get; set; } = DefaultMaxPlanningSeconds;
+
     /// <summary>Number of key ranges the planner aims for; workers pull ranges from a queue.</summary>
     public int TargetPartitions => MaxParallelPartitions * 4;
 
@@ -218,6 +338,7 @@ public class ScanPerformanceOptions
         Check(errors, nameof(MaxObjectsPerSecond), MaxObjectsPerSecond, 0, 100_000_000);
         Check(errors, nameof(MaxConcurrentContentChecks), MaxConcurrentContentChecks, 1, 256);
         Check(errors, nameof(MaxDiscoveryRequests), MaxDiscoveryRequests, 0, 100_000);
+        Check(errors, nameof(MaxPlanningSeconds), MaxPlanningSeconds, 0, 86_400);
         if (MaxParallelPartitions >= 1 && PrefetchPages >= 1 && (long)MaxParallelPartitions * PrefetchPages > MaxBufferedPagesPerBucket)
         {
             errors.Add($"{nameof(MaxParallelPartitions)} x {nameof(PrefetchPages)} must be at most {MaxBufferedPagesPerBucket:N0} to bound memory (was {MaxParallelPartitions:N0} x {PrefetchPages:N0} = {(long)MaxParallelPartitions * PrefetchPages:N0}).");

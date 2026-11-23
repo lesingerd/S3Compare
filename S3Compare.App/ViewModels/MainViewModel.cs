@@ -72,6 +72,7 @@ public class MainViewModel : INotifyPropertyChanged
     private int _maxObjectsPerSecond = ScanPerformanceOptions.DefaultMaxObjectsPerSecond;
     private int _maxConcurrentContentChecks = ScanPerformanceOptions.DefaultMaxConcurrentContentChecks;
     private int _maxDiscoveryRequests = ScanPerformanceOptions.DefaultMaxDiscoveryRequests;
+    private int _maxPlanningSeconds = ScanPerformanceOptions.DefaultMaxPlanningSeconds;
 
     // Checkpoint & Resume state (NO credentials/keys saved)
     private bool _hasResumableCheckpoint = false;
@@ -141,7 +142,7 @@ public class MainViewModel : INotifyPropertyChanged
         ResumeScanCommand = new RelayCommand(async () => await StartComparisonAsync(isResuming: true), () => !IsRunning && HasResumableCheckpoint);
         DiscardCheckpointCommand = new RelayCommand(DiscardActiveCheckpoint, () => !IsRunning && HasResumableCheckpoint);
         PauseResumeCommand = new RelayCommand(TogglePause, () => IsRunning);
-        StopCommand = new RelayCommand(StopComparison, () => IsRunning);
+        StopCommand = new RelayCommand(async () => await RequestStopAsync(), () => IsRunning && !IsStopping);
         TestConnectionACommand = new RelayCommand(async () => await TestConnectionAAsync(), () => !IsRunning && !IsTestingA);
         TestConnectionBCommand = new RelayCommand(async () => await TestConnectionBAsync(), () => !IsRunning && !IsTestingB);
         FetchBucketsACommand = new RelayCommand(async () => await FetchBucketsAAsync(), () => !IsRunning && !IsFetchingBucketsA);
@@ -438,6 +439,12 @@ public class MainViewModel : INotifyPropertyChanged
         set => SetField(ref _maxDiscoveryRequests, value);
     }
 
+    public int MaxPlanningSeconds
+    {
+        get => _maxPlanningSeconds;
+        set => SetField(ref _maxPlanningSeconds, value);
+    }
+
     public ScanPerformanceOptions BuildPerformanceOptions() => new()
     {
         MaxParallelPartitions = MaxParallelPartitions,
@@ -445,7 +452,8 @@ public class MainViewModel : INotifyPropertyChanged
         MaxListRequestsPerSecond = MaxListRequestsPerSecond,
         MaxObjectsPerSecond = MaxObjectsPerSecond,
         MaxConcurrentContentChecks = MaxConcurrentContentChecks,
-        MaxDiscoveryRequests = MaxDiscoveryRequests
+        MaxDiscoveryRequests = MaxDiscoveryRequests,
+        MaxPlanningSeconds = MaxPlanningSeconds
     };
 
     public bool HasResumableCheckpoint
@@ -833,10 +841,132 @@ public class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private void StopComparison()
+    /// <summary>How long Stop (or closing the window) waits for the engine before it is abandoned.</summary>
+    public TimeSpan StopTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    private bool _isStopping;
+    private TaskCompletionSource? _abandonSignal;
+
+    /// <summary>True from pressing Stop until the engine has finished or been abandoned.</summary>
+    public bool IsStopping
     {
-        _cts?.Cancel();
-        StatusMessage = "Stopping comparison...";
+        get => _isStopping;
+        private set
+        {
+            if (SetField(ref _isStopping, value)) InvalidateCommands();
+        }
+    }
+
+    /// <summary>
+    /// Stop with a watchdog. Cancels the scan and shows "Stopping... (N s)". If the engine has not finished after
+    /// <see cref="StopTimeout"/> (a request or disk write that ignores cancellation), the stuck operations are logged and
+    /// shown, the consistent checkpoint is saved, the engine is detached so it cannot write any more rows, and the UI returns to idle.
+    /// </summary>
+    public async Task RequestStopAsync()
+    {
+        var completion = _runCompletion;
+        var engine = _engine;
+        if (!IsRunning || completion == null || IsStopping) return;
+
+        IsStopping = true;
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            try { _cts?.Cancel(); } catch (ObjectDisposedException) { }
+            engine?.Resume(); // a paused engine would never see the cancellation
+
+            while (!completion.Task.IsCompleted && watch.Elapsed < StopTimeout)
+            {
+                StatusMessage = $"Stopping... ({(int)watch.Elapsed.TotalSeconds} s){DescribeStall(_stats)}";
+                await Task.WhenAny(completion.Task, Task.Delay(TimeSpan.FromMilliseconds(500)));
+            }
+
+            if (!completion.Task.IsCompleted && engine != null)
+            {
+                StatusMessage = $"Stopping... ({(int)watch.Elapsed.TotalSeconds} s) no response; abandoning the engine and saving a checkpoint...";
+                string? checkpoint = await engine.AbandonAsync($"no response {(int)watch.Elapsed.TotalSeconds} s after Stop");
+                _abandonSignal?.TrySetResult();
+                await Task.WhenAny(completion.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+                StatusMessage = checkpoint != null
+                    ? $"Stopped. The engine did not respond for {(int)watch.Elapsed.TotalSeconds} s and was abandoned; checkpoint saved, you can resume. Details are in the diagnostics log."
+                    : $"Stopped. The engine did not respond for {(int)watch.Elapsed.TotalSeconds} s and was abandoned; the last periodic checkpoint (if any) is kept. Details are in the diagnostics log.";
+            }
+        }
+        finally
+        {
+            IsStopping = false;
+        }
+    }
+
+    /// <summary>" | waiting 12 s on LIST A ..." when the oldest in-flight operation has been pending for a while.</summary>
+    private static string DescribeStall(ComparisonStatistics stats)
+    {
+        var oldest = stats.InFlight.FirstOrDefault();
+        return oldest != null && oldest.AgeSeconds >= 3 ? $" | waiting on: {oldest}" : string.Empty;
+    }
+
+    /// <summary>The status-bar text for the engine's current phase.</summary>
+    public static string BuildStatusMessage(ComparisonStatistics stats)
+    {
+        string phase = DiagnosticsFormatter.DisplayPhase(stats).ToUpperInvariant();
+        string stall = DescribeStall(stats);
+        string text = stats.Phase switch
+        {
+            "Planning" => $"Planning key-range partitions: {stats.Planner?.Summary ?? "starting"}",
+            "Finalizing" => $"Finalizing: {stats.LatestStep}",
+            "Starting" => stats.LatestStep,
+            _ => $"{stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | Partitions: {stats.PartitionsCompleted:N0}/{stats.PartitionsTotal:N0} done, {stats.ActivePartitions} active | RAM: {stats.WorkingSetMB:F0} MB"
+        };
+        if (stats.IsPaused && stats.Phase == "Planning") text = "(planner waits while paused) " + text;
+        return $"[{phase}] {text}{stall}";
+    }
+
+    private string _phaseText = "IDLE";
+    private string _diagnosticsText = "No scan has been started.";
+    private bool _isDiagnosticsExpanded;
+
+    public string PhaseText
+    {
+        get => _phaseText;
+        private set => SetField(ref _phaseText, value);
+    }
+
+    /// <summary>Plain-text diagnostics block (phase, planner, request rates, in-flight operations, last error); same text goes to the log.</summary>
+    public string DiagnosticsText
+    {
+        get => _diagnosticsText;
+        private set => SetField(ref _diagnosticsText, value);
+    }
+
+    public bool IsDiagnosticsExpanded
+    {
+        get => _isDiagnosticsExpanded;
+        set => SetField(ref _isDiagnosticsExpanded, value);
+    }
+
+    /// <summary>Per-partition rows of the diagnostics table (updated in place so the grid keeps its scroll position).</summary>
+    public ObservableCollection<PartitionStatus> PartitionRows { get; } = new();
+
+    /// <summary>Applies an engine snapshot to the status bar, phase chip and diagnostics panel. UI thread only.</summary>
+    internal void ApplyStatistics(ComparisonStatistics stats)
+    {
+        Statistics = stats;
+        PhaseText = DiagnosticsFormatter.DisplayPhase(stats).ToUpperInvariant();
+        if (!IsStopping) StatusMessage = BuildStatusMessage(stats);
+
+        if (IsDiagnosticsExpanded)
+        {
+            DiagnosticsText = DiagnosticsFormatter.Format(stats);
+            if (PartitionRows.Count != stats.Partitions.Count)
+            {
+                PartitionRows.Clear();
+                foreach (var p in stats.Partitions) PartitionRows.Add(p);
+            }
+            else
+            {
+                for (int i = 0; i < PartitionRows.Count; i++) PartitionRows[i].UpdateFrom(stats.Partitions[i]);
+            }
+        }
     }
 
     private void ClearResults()
@@ -846,6 +976,9 @@ public class MainViewModel : INotifyPropertyChanged
         RecentItemsA.Clear();
         RecentItemsB.Clear();
         Statistics = new ComparisonStatistics();
+        PhaseText = "IDLE";
+        DiagnosticsText = "No scan has been started.";
+        PartitionRows.Clear();
         StatusA = "Idle";
         StatusB = "Idle";
         CurrentKeyA = "-";
@@ -894,7 +1027,11 @@ public class MainViewModel : INotifyPropertyChanged
         ScanCheckpoint? checkpointToUse = isResuming ? ActiveCheckpoint : null;
         var cts = new CancellationTokenSource();
         _cts = cts;
-        _runCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _runCompletion = runCompletion;
+        var abandonSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _abandonSignal = abandonSignal;
+        BucketComparisonEngine? engine = null;
 
         try
         {
@@ -951,7 +1088,7 @@ public class MainViewModel : INotifyPropertyChanged
             }
             _sessionCsvPath = csvPath;
 
-            var engine = new BucketComparisonEngine(
+            engine = new BucketComparisonEngine(
                 configA,
                 configB,
                 mode,
@@ -973,9 +1110,11 @@ public class MainViewModel : INotifyPropertyChanged
 
             engine.ProgressUpdated += stats =>
             {
+                var source = engine;
                 dispatcher?.InvokeAsync(() =>
                 {
-                    Statistics = stats;
+                    if (!ReferenceEquals(_engine, source)) return; // a detached (abandoned) engine must not touch the UI
+                    ApplyStatistics(stats);
                     CurrentKeyA = stats.CurrentKeyA;
                     CurrentKeyB = stats.CurrentKeyB;
                     ObjectsReadA = stats.BucketAObjectsRead;
@@ -984,9 +1123,6 @@ public class MainViewModel : INotifyPropertyChanged
                     BytesReadB = S3ObjectSummary.FormatSize(stats.BucketBBytesRead);
                     StatusA = $"Paging ({stats.BucketAObjectsRead:N0} objects read)";
                     StatusB = $"Paging ({stats.BucketBObjectsRead:N0} objects read)";
-                    StatusMessage = stats.Phase == "Planning"
-                        ? "Planning key-range partitions (listing folder structure of both buckets)..."
-                        : $"Streaming comparison in progress... {stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | Partitions: {stats.PartitionsCompleted:N0}/{stats.PartitionsTotal:N0} done, {stats.ActivePartitions} active | RAM: {stats.WorkingSetMB:F0} MB";
                 });
             };
 
@@ -995,7 +1131,17 @@ public class MainViewModel : INotifyPropertyChanged
             engine.PageLoadedA += page => ShowRecentItems(dispatcher, RecentItemsA, page);
             engine.PageLoadedB += page => ShowRecentItems(dispatcher, RecentItemsB, page);
 
-            var finalStats = await Task.Run(() => engine.RunAsync(cts.Token));
+            var runTask = Task.Run(() => engine.RunAsync(cts.Token));
+            if (await Task.WhenAny(runTask, abandonSignal.Task) != runTask)
+            {
+                // The stop watchdog gave up on the engine (see RequestStopAsync); its task is left to finish on its own
+                _ = runTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                StatusA = "Stopped";
+                StatusB = "Stopped";
+                return;
+            }
+            var finalStats = await runTask;
+            ApplyStatistics(finalStats);
 
             StatusMessage = $"Comparison Complete! Evaluated {finalStats.ObjectsCompared:N0} items. Found {finalStats.TotalDifferences:N0} differences, {finalStats.MatchedCount:N0} matched.";
             StatusA = "Complete";
@@ -1024,12 +1170,15 @@ public class MainViewModel : INotifyPropertyChanged
             _diffTimer = null;
             DrainDifferences(MaxUiDifferences);
 
-            IsRunning = false;
-            IsPaused = false;
+            if (ReferenceEquals(_runCompletion, runCompletion))
+            {
+                IsRunning = false;
+                IsPaused = false;
+                _cts = null;
+                _engine = null;
+            }
             cts.Dispose();
-            _cts = null;
-            _engine = null;
-            _runCompletion?.TrySetResult();
+            runCompletion.TrySetResult();
             _ = CheckForCheckpointsAsync();
         }
     }
@@ -1043,16 +1192,9 @@ public class MainViewModel : INotifyPropertyChanged
         var completion = _runCompletion;
         if (!IsRunning || completion == null) return;
 
-        try
-        {
-            _cts?.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        _engine?.Resume();
-
-        await Task.WhenAny(completion.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+        // Same watchdog as the Stop button: after StopTimeout a stuck engine is abandoned so the window can close
+        await RequestStopAsync();
+        await Task.WhenAny(completion.Task, Task.Delay(StopTimeout + TimeSpan.FromSeconds(5)));
     }
 
     private static void ShowRecentItems(Dispatcher? dispatcher, ObservableCollection<S3ObjectSummary> target, List<S3ObjectSummary> page)

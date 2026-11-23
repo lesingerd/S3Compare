@@ -17,6 +17,11 @@ public sealed class TokenBucketRateLimiter
     public double RatePerSecond { get; }
     public double Capacity { get; }
 
+    private long _waitedTicks;
+
+    /// <summary>Total time callers have been delayed by this limiter (shown in diagnostics).</summary>
+    public double TotalWaitSeconds => TimeSpan.FromTicks(Interlocked.Read(ref _waitedTicks)).TotalSeconds;
+
     public TokenBucketRateLimiter(double ratePerSecond, double capacity)
     {
         if (ratePerSecond <= 0) throw new ArgumentOutOfRangeException(nameof(ratePerSecond));
@@ -45,7 +50,20 @@ public sealed class TokenBucketRateLimiter
             debtSeconds = -_tokens / RatePerSecond;
         }
 
-        return Task.Delay(TimeSpan.FromSeconds(debtSeconds), cancellationToken);
+        return DelayAsync(TimeSpan.FromSeconds(debtSeconds), cancellationToken);
+    }
+
+    private async Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
+    {
+        long start = Stopwatch.GetTimestamp();
+        try
+        {
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Add(ref _waitedTicks, Stopwatch.GetElapsedTime(start).Ticks);
+        }
     }
 }
 

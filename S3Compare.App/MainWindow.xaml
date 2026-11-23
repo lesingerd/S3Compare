@@ -708,6 +708,10 @@
                                 <TextBlock Text="Discovery requests:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
                                 <TextBox Text="{Binding MaxDiscoveryRequests, UpdateSourceTrigger=PropertyChanged}"
                                          ToolTip="MaxDiscoveryRequests (default 500, 0-100000): LIST requests (both buckets together) the partition planner may spend finding range boundaries before the scan starts. 0 = no planning (one range)."/>
+
+                                <TextBlock Text="Planning time limit (s):" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
+                                <TextBox Text="{Binding MaxPlanningSeconds, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="MaxPlanningSeconds (default 60, 0 = unlimited): planning time box. When exceeded the planner stops sending requests and builds key ranges from the boundaries found so far (fewer, larger ranges; the scan still covers every key). Time spent paused does not count."/>
                             </WrapPanel>
                         </Border>
                     </Expander>
@@ -870,7 +874,11 @@
         <Border Grid.Row="2" Background="#1E293B" CornerRadius="6" Padding="10,8" Margin="0,2,0,4" BorderBrush="#334155" BorderThickness="1">
             <Grid>
                 <Grid.RowDefinitions>
+                    <!-- Phase strip -->
+                    <RowDefinition Height="Auto"/>
                     <!-- Statistics Summary Cards -->
+                    <RowDefinition Height="Auto"/>
+                    <!-- Diagnostics expander -->
                     <RowDefinition Height="Auto"/>
                     <!-- Filter Toolbar -->
                     <RowDefinition Height="Auto"/>
@@ -878,8 +886,31 @@
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
 
+                <!-- PHASE STRIP: what the scan is doing right now -->
+                <Border Grid.Row="0" Background="#0F172A" CornerRadius="4" Padding="8,4" Margin="0,0,0,6" BorderBrush="#334155" BorderThickness="1">
+                    <DockPanel>
+                        <Border DockPanel.Dock="Left" CornerRadius="3" Padding="8,1" Margin="0,0,10,0" VerticalAlignment="Center" MinWidth="86">
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Setter Property="Background" Value="#475569"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding PhaseText}" Value="PLANNING"><Setter Property="Background" Value="#B45309"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding PhaseText}" Value="SCANNING"><Setter Property="Background" Value="#15803D"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding PhaseText}" Value="FINALIZING"><Setter Property="Background" Value="#1D4ED8"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding PhaseText}" Value="PAUSED"><Setter Property="Background" Value="#C2410C"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding PhaseText}" Value="FAILED"><Setter Property="Background" Value="#B91C1C"/></DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <TextBlock Text="{Binding PhaseText}" Foreground="White" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center"/>
+                        </Border>
+                        <TextBlock Text="{Binding Statistics.LatestStep, StringFormat=Step: {0}}" Foreground="#CBD5E1" FontSize="11" VerticalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" ToolTip="{Binding Statistics.LatestStep}"/>
+                    </DockPanel>
+                </Border>
+
                 <!-- STATS CARDS -->
-                <Grid Grid.Row="0" Margin="0,0,0,6">
+                <Grid Grid.Row="1" Margin="0,0,0,6">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
@@ -973,8 +1004,44 @@
                     </Border>
                 </Grid>
 
+                <!-- SCAN DIAGNOSTICS (screenshot-friendly) -->
+                <Expander Grid.Row="2" Margin="0,0,0,6" IsExpanded="{Binding IsDiagnosticsExpanded, Mode=TwoWay}" Foreground="#94A3B8"
+                          ToolTip="Phase, planner progress, per-bucket LIST latency and rate, in-flight requests, partitions and the last error. The same text is written to the diagnostics log.">
+                    <Expander.Header>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Scan Diagnostics" FontWeight="SemiBold" FontSize="12" Foreground="#94A3B8"/>
+                            <TextBlock FontSize="11" Foreground="#64748B" Margin="8,1,0,0" Text="(expand and screenshot this panel when reporting a problem)"/>
+                        </StackPanel>
+                    </Expander.Header>
+                    <Grid Margin="0,4,0,0" MaxHeight="260">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" MinWidth="360"/>
+                            <ColumnDefinition Width="12"/>
+                            <ColumnDefinition Width="*" MinWidth="320"/>
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0" Background="#0F172A" CornerRadius="4" Padding="8,6" BorderBrush="#334155" BorderThickness="1">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                                <TextBlock Text="{Binding DiagnosticsText}" FontFamily="Consolas" FontSize="11" Foreground="#E2E8F0" TextWrapping="NoWrap"/>
+                            </ScrollViewer>
+                        </Border>
+                        <DataGrid Grid.Column="2" ItemsSource="{Binding PartitionRows}" AutoGenerateColumns="False" IsReadOnly="True"
+                                  Background="#0F172A" RowBackground="#0F172A" AlternatingRowBackground="#172033" Foreground="#E2E8F0"
+                                  GridLinesVisibility="None" HeadersVisibility="Column" FontSize="11" CanUserAddRows="False"
+                                  EnableRowVirtualization="True" BorderBrush="#334155">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40"/>
+                                <DataGridTextColumn Header="Lower" Binding="{Binding Lower}" Width="*" FontFamily="Consolas"/>
+                                <DataGridTextColumn Header="Upper" Binding="{Binding Upper}" Width="*" FontFamily="Consolas"/>
+                                <DataGridTextColumn Header="State" Binding="{Binding State}" Width="70"/>
+                                <DataGridTextColumn Header="Last completed key" Binding="{Binding LastCompletedKey}" Width="*" FontFamily="Consolas"/>
+                                <DataGridTextColumn Header="Compared" Binding="{Binding ObjectsCompared, StringFormat={}{0:N0}}" Width="80"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
+                </Expander>
+
                 <!-- FILTER TOOLBAR -->
-                <DockPanel Grid.Row="1" Margin="0,0,0,6">
+                <DockPanel Grid.Row="3" Margin="0,0,0,6">
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                         <TextBlock Text="Differences Log" FontSize="13" FontWeight="Bold" Foreground="#F8FAFC" VerticalAlignment="Center" Margin="0,0,12,0"/>
                         <TextBlock Text="Filter:" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,6,0"/>
@@ -986,7 +1053,7 @@
                 </DockPanel>
 
                 <!-- DIFFERENCES DATAGRID -->
-                <DataGrid Grid.Row="2" ItemsSource="{Binding FilteredDifferences}" AutoGenerateColumns="False" IsReadOnly="True"
+                <DataGrid Grid.Row="4" ItemsSource="{Binding FilteredDifferences}" AutoGenerateColumns="False" IsReadOnly="True"
                           Background="#0F172A" RowBackground="#0F172A" AlternatingRowBackground="#172033"
                           Foreground="#F8FAFC" BorderBrush="#334155" GridLinesVisibility="Horizontal"
                           HorizontalGridLinesBrush="#334155" HeadersVisibility="Column" SelectionMode="Single">
@@ -1028,8 +1095,11 @@
             <DockPanel>
                 <TextBlock DockPanel.Dock="Right" Text="Wasabi S3 Compare Tool | Zero-Disk-Persistence" 
                            Foreground="#64748B" FontSize="11" VerticalAlignment="Center"/>
+                <Border DockPanel.Dock="Left" Background="#334155" CornerRadius="3" Padding="6,1" Margin="0,0,8,0" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding PhaseText}" Foreground="#F8FAFC" FontSize="11" FontWeight="Bold"/>
+                </Border>
                 <TextBlock Text="{Binding StatusMessage}" Foreground="#38BDF8" FontSize="12" FontWeight="SemiBold"
-                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip="{Binding StatusMessage}"/>
             </DockPanel>
         </Border>
     </Grid>

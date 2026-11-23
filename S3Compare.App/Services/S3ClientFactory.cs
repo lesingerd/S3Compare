@@ -8,6 +8,10 @@ namespace S3Compare.App.Services;
 
 public static class S3ClientFactory
 {
+    /// <summary>Was 45 s x 4 attempts (about 3 minutes for one hung request); now 30 s x 3 attempts at most for one-off calls.</summary>
+    public const int DefaultTimeoutSeconds = 30;
+    public const int DefaultMaxErrorRetry = 2;
+
     public static List<S3EndpointPreset> GetWasabiEndpoints()
     {
         return new List<S3EndpointPreset>
@@ -35,15 +39,20 @@ public static class S3ClientFactory
     /// HTTP connections the client may open to the endpoint; a parallel scan needs one per in-flight LIST and download.
     /// 0 keeps the SDK default.
     /// </param>
-    public static AmazonS3Client CreateClient(S3BucketConfig config, int maxConnectionsPerServer = 0)
+    /// <param name="maxErrorRetry">
+    /// SDK-internal retries (with backoff, invisible to the UI). The scan creates its clients with 0 and retries LIST calls
+    /// itself in <see cref="AmazonS3Lister"/>, where every attempt is visible in the diagnostics; content downloads are retried by the engine.
+    /// </param>
+    /// <param name="timeoutSeconds">HTTP timeout of one attempt. Worst case for one SDK call is (retries + 1) x this plus backoff.</param>
+    public static AmazonS3Client CreateClient(S3BucketConfig config, int maxConnectionsPerServer = 0, int maxErrorRetry = DefaultMaxErrorRetry, int timeoutSeconds = DefaultTimeoutSeconds)
     {
         var credentials = new BasicAWSCredentials(config.AccessKey.Trim(), config.SecretKey.Trim());
 
         var s3Config = new AmazonS3Config
         {
             ForcePathStyle = true,
-            Timeout = TimeSpan.FromSeconds(45),
-            MaxErrorRetry = 3
+            Timeout = TimeSpan.FromSeconds(timeoutSeconds),
+            MaxErrorRetry = maxErrorRetry
         };
 
         if (maxConnectionsPerServer > 0)
