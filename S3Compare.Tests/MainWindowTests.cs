@@ -51,6 +51,7 @@ public class MainWindowTests
                 Assert.Equal(0, defaults.MaxObjectsPerSecond);
                 Assert.Equal(8, defaults.MaxConcurrentContentChecks);
                 Assert.Equal(500, defaults.MaxDiscoveryRequests);
+                Assert.Equal(60, defaults.MaxPlanningSeconds);
                 Assert.Empty(defaults.Validate());
 
                 vm.MaxParallelPartitions = 0;

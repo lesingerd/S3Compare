@@ -81,6 +81,7 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
 
 ### 6. Continuous Diagnostics & Crash Logging
 - Real-time heartbeat logging flushes every 10 seconds to `logs/scan_diagnostics_YYYY-MM-DD_HH-mm-ss.log`:
+  - Every engine phase step, planner progress and failures, and a full diagnostics block (the same text as the UI's Scan Diagnostics panel) - see [Seeing what a scan is doing](#seeing-what-a-scan-is-doing)
   - Current timestamp and active S3 key evaluated
   - Processing rate (`objects/sec`)
   - **Working Set RAM (MB)**, **GC Total Memory (MB)**, and GC Gen 0/1/2 collection counts
@@ -102,7 +103,22 @@ Comparing hundreds of terabytes or tens of millions of objects cannot load entir
 1. **Prefetch + concurrent A/B**: each listing runs on a background producer that requests page N+1 as soon as page N arrives, into a bounded buffer of `PrefetchPages` pages. Bucket A and Bucket B are listed at the same time, so a page costs one round trip instead of latency(A) + latency(B).
 2. **Key-range partitioning**: S3 lists keys in UTF-8 byte order, so the keyspace (relative to each bucket's own prefix) is split into ranges `(lower, upper]` that are compared by independent merge-joins. Each range lists both buckets with `StartAfter = prefix + lower` and stops after `upper`.
    - **Planning** (before the scan, at most `MaxDiscoveryRequests` LIST calls): `Delimiter="/"` listings on both buckets, descending up to 3 folder levels, collect folder names as candidate boundaries. Flat namespaces fall back to rounds of `MaxKeys=1` probes that sample real keys: the first round probes each printable ASCII first character, and every later round probes one character deeper under each populated prefix found so far. Keys with a long shared prefix and no `/` (`file_00001.dat`, `IMG_0001.jpg`, `logs-2024-…`) are descended until they branch, with no depth cap; a prefix with a single child costs only a few probes because probes whose answer is already known are not sent. Probes are issued coarse to fine (spread over the whole character range first) and the remaining budget is split between the buckets, so a small budget still covers the whole keyspace. About `MaxParallelPartitions × 4` evenly spaced boundaries are chosen; workers pull ranges from a queue so uneven ranges balance out.
+   - **Planning is bounded and visible.** Independent planner requests (the folders of one level, a wave of probes) run concurrently, up to 8 per bucket, within the request budget and the rate limiter. Every planner request has a 15 s timeout and is abandoned even if the connection ignores cancellation; a failed or timed-out request is logged and skipped, never fatal. If a bucket rejects the delimiter listing it is switched to probes for the rest of the plan (logged once); probing is switched off for a bucket after 3 failures in a row. The planner only ever uses ordinary `StartAfter` values (the prefix plus a printable ASCII character), never a U+10FFFF-style sentinel. Only stopping the scan aborts planning. Progress is shown live (see [Seeing what a scan is doing](#seeing-what-a-scan-is-doing)).
    - The ranges always tile the keyspace exactly, so **planning quality only affects speed, never results**: a partitioned scan reports exactly the same differences and counts as a single-stream scan.
+
+#### Seeing what a scan is doing
+
+The UI is built so that a screenshot is enough to diagnose a slow or stalled scan.
+
+- **Phase chip and step** (top of the results panel, and a small chip at the left of the status bar): `PLANNING`, `SCANNING`, `FINALIZING` or `PAUSED` (also `STOPPED`/`FAILED`/`COMPLETED`), plus the latest engine step (`Step: ...`). Every step is also written to the diagnostics log.
+- **Status bar while planning**: `[PLANNING] <step> | requests used/budget | candidates | elapsed of time limit | failed N | TIME LIMIT REACHED`. The step names what the planner is doing per bucket, for example `A: delimiter depth 2/3 (14 folders) | B: probe round 4: shared-prefix jump to depth 3 ('fil', 1 prefixes)`.
+- **Waiting on a request**: when the oldest in-flight request is older than 3 s the status bar appends `waiting on: LIST A bucket '...' prefix='...' startAfter='...' delimiter='...' maxKeys=... | age 31.0s | attempt 2`. In-flight operations also include the CSV writer (`CSV writer: writing N row(s) ...`) when a disk write is slow.
+- **Scan Diagnostics expander** (below the phase strip; expand it before taking the screenshot): phase and latest step; planner state (running/finished, step, requests used/budget, failed requests, candidates, elapsed/limit, disabled techniques, last planner error); partitions done/running; per bucket the LIST request count, failures, recent requests/s, average and last page latency and rate-limiter wait; total LIST requests; in-flight operations (with age and attempt); and the last error. Next to it a per-partition table: index, lower bound, upper bound, state (Pending/Running/Done), last completed key and keys compared (this run only; after a resume the count restarts at 0).
+- **Diagnostics log**: the same text is written to `logs/scan_diagnostics_*.log` every 10 s (`[DIAGNOSTICS] periodic`), at abandon, together with every phase step, planner start/finish lines, each distinct planner failure and a disabled-technique notice.
+
+**Stop and the watchdog.** Press Stop and the status bar shows `Stopping... (N s)` (plus the request it is waiting on). Cancellation reaches every LIST and download even when the HTTP layer ignores it, so a stop normally completes in well under a second. If the engine has not finished after 20 s (a hung disk write, say) the stuck operations are logged and shown, the checkpoint that is consistent with the live CSV is saved (when the writer is not itself stuck; otherwise the last periodic checkpoint stays valid), the engine is detached so it can no longer write CSV rows, raise differences or touch checkpoints, and the UI returns to idle: **Resume Scan** is offered as usual. Closing the window uses the same watchdog.
+
+**Timeouts and retries.** The SDK's own retries are turned off for the scan's clients (`MaxErrorRetry = 0`, HTTP timeout 30 s per attempt, so no more silent multi-minute stalls: the old settings, 45 s and 3 retries, let one hung request take about 3 minutes). `ListObjectsV2` calls are retried by S3Compare itself, up to 3 attempts of at most 30 s each with 1 s/2 s pauses, for timeouts, network errors, throttling and 5xx answers (not for access-denied or no-such-bucket); the attempt number is shown in the in-flight list. Full Data downloads keep their own 2-attempt retry. Connection tests and bucket discovery still use the SDK default (30 s, 2 retries).
 
 All partitions share one live CSV writer, one statistics aggregate, the pause button and the throttles. Pausing also holds planning between requests.
 
@@ -114,6 +130,7 @@ All partitions share one live CSV writer, one statistics aggregate, the pause bu
 | `MaxObjectsPerSecond` | 0 | Aggregate cap on keys compared per second (token bucket, consumed in batches). One token per key: a key present in both buckets costs 1, as does a key present in only one. `0` = unlimited. |
 | `MaxConcurrentContentChecks` | 8 | Full Data mode: object pairs downloaded at the same time across all partitions (1–256). |
 | `MaxDiscoveryRequests` | 500 | LIST budget for partition planning, both buckets together (0–100,000). `0` = no planning (one range). |
+| `MaxPlanningSeconds` | 60 | Time box for planning (0-86,400 s; **0 = unlimited**). When it is exceeded the planner stops sending requests and builds ranges from the candidates found so far, so a slow endpoint cannot delay the scan start indefinitely; the plan is coarser but still tiles the keyspace, so results are unaffected. Paused time does not count. |
 
 Set them in the collapsible **🚀 Performance / Throttling** section under the options bar (each field has a tooltip). They are validated when you start a scan. They do not affect correctness, so a checkpoint can be resumed with different values (the saved partition plan is reused). The setting names are identical in the sister project S3CompareService.
 
@@ -165,7 +182,7 @@ dotnet run --project S3Compare.App/S3Compare.App.csproj
 ```powershell
 dotnet test
 ```
-*Runs all 89 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
+*Runs all 108 automated xUnit tests validating the streaming two-way merge diff, the prefetching listing stream, the partition planner (hierarchical, flat, unicode, different prefixes), partitioned-vs-single-stream equivalence, cancel/resume CSV consistency, planner time box and request resilience, in-flight diagnostics and the stop watchdog (including listers that ignore cancellation), throttling, sequence gap detector, checkpoint save/load/delete roundtrips, partner metadata capture, report export, and WPF window instantiation. An in-memory fake `ListObjectsV2` (with latency and fault injection) keeps them fast.*
 
 ### Publish Standalone Executable
 ```powershell
@@ -185,8 +202,10 @@ S3Compare/
 │   ├── Services/
 │   │   ├── BucketComparisonEngine.cs   # Partitioned two-way streaming merge diff engine
 │   │   ├── CheckpointManager.cs        # Atomic checkpoint save/resume manager
+│   │   ├── DiagnosticsFormatter.cs     # Plain-text diagnostics block (UI panel and log)
 │   │   ├── IS3Lister.cs                # ListObjectsV2 abstraction (+ AmazonS3Lister)
 │   │   ├── IS3ObjectStream.cs          # Streaming interface abstraction
+│   │   ├── ListDiagnostics.cs          # Request metrics, in-flight tracking, cancellable lister decorator
 │   │   ├── PartitionPlanner.cs         # Splits the keyspace into key ranges
 │   │   ├── PrefetchingObjectStream.cs  # Background-prefetching paged listing of a key range
 │   │   ├── ReportExporter.cs           # CSV and JSON report exporter
@@ -201,6 +220,7 @@ S3Compare/
 ├── S3Compare.Tests/                    # Automated xUnit Test Suite
 │   ├── FakeS3Lister.cs                 # In-memory ListObjectsV2 with latency/fault injection
 │   ├── MainWindowTests.cs              # UI and window instantiation tests
+│   ├── PlanningVisibilityTests.cs      # Planner time box, resilience, concurrency, diagnostics, abandon watchdog
 │   ├── ParallelEngineTests.cs          # Partitioned engine equivalence, resume, throttling
 │   ├── PrefetchAndPlannerTests.cs      # Prefetch stream, rate limiter, partition planner
 │   └── StreamingComparisonTests.cs     # Gap detection, checkpoint, and comparison tests
