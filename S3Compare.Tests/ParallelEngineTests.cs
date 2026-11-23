@@ -78,6 +78,12 @@ public class ParallelEngineTests
         };
     }
 
+    /// <summary>
+    /// Tests that inject a fault or a cancel at a given LIST call number assume the planner used few calls. The planner now keeps
+    /// descending while it is affordable, so these tests limit it to the two levels it used to list for this data.
+    /// </summary>
+    private static void PlanTwoLevels(ScanPerformanceOptions options) => options.MaxDiscoveryDepth = 2;
+
     /// <summary>Reference result: the classic single merge-join over two plain streams.</summary>
     private static async Task<(ComparisonStatistics Stats, List<ObjectDifference> Diffs)> RunSingleStreamAsync(BucketPair data, bool detectGaps = false)
     {
@@ -291,14 +297,14 @@ public class ParallelEngineTests
         string referenceCsv = dir.File("reference.csv");
 
         // Uninterrupted reference
-        var referenceStats = await PartitionedEngine(data, data.ToLister(), dir, 4, referenceCsv, pageSize: 25).RunAsync();
+        var referenceStats = await PartitionedEngine(data, data.ToLister(), dir, 4, referenceCsv, pageSize: 25, tune: PlanTwoLevels).RunAsync();
 
         // Run 1: cancelled from inside the listing while several partitions are mid-range
         using var cts = new CancellationTokenSource();
         var slow = data.ToLister(TimeSpan.FromMilliseconds(2));
         slow.OnCall = call => { if (call.Number == cancelAtCall) cts.Cancel(); };
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            PartitionedEngine(data, slow, dir, 4, interruptedCsv, pageSize: 25).RunAsync(cts.Token));
+            PartitionedEngine(data, slow, dir, 4, interruptedCsv, pageSize: 25, tune: PlanTwoLevels).RunAsync(cts.Token));
 
         var checkpoint = await CheckpointManager.FindCheckpointAsync(
             "bucket-a", "https://fake.invalid", "", "bucket-b", "https://fake.invalid", "", ComparisonMode.ListingOnly, dir.Path);
@@ -384,7 +390,7 @@ public class ParallelEngineTests
         lister.Fault = call => call.Number == 40 ? new IOException("connection reset") : null;
 
         var ex = await Assert.ThrowsAsync<IOException>(() =>
-            PartitionedEngine(data, lister, dir, 4, dir.File("live.csv"), pageSize: 20).RunAsync().WaitAsync(TimeSpan.FromSeconds(30)));
+            PartitionedEngine(data, lister, dir, 4, dir.File("live.csv"), pageSize: 20, tune: PlanTwoLevels).RunAsync().WaitAsync(TimeSpan.FromSeconds(30)));
         Assert.Equal("connection reset", ex.Message);
 
         var checkpoint = await CheckpointManager.FindCheckpointAsync(
@@ -619,13 +625,13 @@ public class ParallelEngineTests
         string interruptedCsv = dir.File("interrupted.csv");
         string referenceCsv = dir.File("reference.csv");
 
-        var referenceStats = await PartitionedEngine(data, data.ToLister(), dir, 4, referenceCsv, pageSize: 25).RunAsync();
+        var referenceStats = await PartitionedEngine(data, data.ToLister(), dir, 4, referenceCsv, pageSize: 25, tune: PlanTwoLevels).RunAsync();
 
         using var cts = new CancellationTokenSource();
         var slow = data.ToLister(TimeSpan.FromMilliseconds(2));
         slow.OnCall = call => { if (call.Number == 80) cts.Cancel(); };
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            PartitionedEngine(data, slow, dir, 4, interruptedCsv, pageSize: 25).RunAsync(cts.Token));
+            PartitionedEngine(data, slow, dir, 4, interruptedCsv, pageSize: 25, tune: PlanTwoLevels).RunAsync(cts.Token));
 
         var checkpoint = await CheckpointManager.FindCheckpointAsync(
             "bucket-a", "https://fake.invalid", "", "bucket-b", "https://fake.invalid", "", ComparisonMode.ListingOnly, dir.Path);

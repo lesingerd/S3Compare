@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using S3Compare.App.Services;
 using System.Text.Json.Serialization;
 
 namespace S3Compare.App.Models;
@@ -149,6 +150,8 @@ public class ComparisonStatistics
     public int PartitionsTotal { get; set; }
     public int PartitionsCompleted { get; set; }
     public int ActivePartitions { get; set; }
+    /// <summary>Running ranges split so an idle worker could take their second half (work stealing).</summary>
+    public int PartitionSplits { get; set; }
     public bool IsPaused { get; set; }
 
     // Diagnostics (screenshot-friendly panel and log)
@@ -281,6 +284,40 @@ public class ScanPartition
     public string? LastCompletedKey { get; set; }
     public bool Completed { get; set; }
 
+    // Live state of a running scan (never saved in a checkpoint). The engine reads and writes these, and Upper, under its state lock.
+
+    /// <summary>True while a worker runs this range.</summary>
+    [JsonIgnore]
+    public bool Active { get; set; }
+
+    /// <summary>The relative key the worker is processing (or last processed); a split key must sort after it.</summary>
+    [JsonIgnore]
+    public string? InFlightKey { get; set; }
+
+    /// <summary>Engine clock (ms) when a worker started this range, or when it was last split.</summary>
+    [JsonIgnore]
+    public long ActiveSinceMs { get; set; }
+
+    /// <summary>True while an idle worker looks for a split key of this range.</summary>
+    [JsonIgnore]
+    public bool Splitting { get; set; }
+
+    /// <summary>Engine clock (ms) before which no new split of this range is attempted (back-off after a failed attempt).</summary>
+    [JsonIgnore]
+    public long NextSplitAttemptMs { get; set; }
+
+    /// <summary>Split attempts of this range that found no usable key, in a row.</summary>
+    [JsonIgnore]
+    public int SplitFailures { get; set; }
+
+    /// <summary>Keys compared in this range during this run.</summary>
+    [JsonIgnore]
+    public long ObjectsCompared { get; set; }
+
+    /// <summary>True for the second half of a split: its sequence-gap detector is seeded with <see cref="Lower"/> (the last key of the first half).</summary>
+    [JsonIgnore]
+    public bool CreatedBySplit { get; set; }
+
     public ScanPartition Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed };
 
     public override string ToString() => $"({Lower ?? "-inf"}, {Upper ?? "+inf"}]";
@@ -327,6 +364,24 @@ public class ScanPerformanceOptions
     /// </summary>
     public int MaxPlanningSeconds { get; set; } = DefaultMaxPlanningSeconds;
 
+    /// <summary>Folder levels the planner may list (0 = probes only). Not shown in the UI; tests lower it.</summary>
+    public int MaxDiscoveryDepth { get; set; } = PartitionPlanner.MaxDiscoveryDepth;
+
+    /// <summary>
+    /// Work stealing: when a worker has no queued range left, it splits the rest of a running range and takes the second half,
+    /// so one big range cannot leave the other workers idle. On by default.
+    /// </summary>
+    public bool EnableRangeSplitting { get; set; } = true;
+
+    /// <summary>A range must have been running this long before an idle worker splits it (not a UI setting; tests shorten it).</summary>
+    public TimeSpan MinRangeAgeForSplit { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>How often an idle worker looks again for a range to split (not a UI setting; tests shorten it).</summary>
+    public TimeSpan SplitIdlePoll { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>Time limit of one split request (not a UI setting; tests shorten it).</summary>
+    public TimeSpan SplitRequestTimeout { get; set; } = PlannerOptions.DefaultRequestTimeout;
+
     /// <summary>Number of key ranges the planner aims for; workers pull ranges from a queue.</summary>
     public int TargetPartitions => MaxParallelPartitions * 4;
 
@@ -344,6 +399,7 @@ public class ScanPerformanceOptions
         Check(errors, nameof(MaxConcurrentContentChecks), MaxConcurrentContentChecks, 1, 256);
         Check(errors, nameof(MaxDiscoveryRequests), MaxDiscoveryRequests, 0, 100_000);
         Check(errors, nameof(MaxPlanningSeconds), MaxPlanningSeconds, 0, 86_400);
+        Check(errors, nameof(MaxDiscoveryDepth), MaxDiscoveryDepth, 0, 10);
         if (MaxParallelPartitions >= 1 && PrefetchPages >= 1 && (long)MaxParallelPartitions * PrefetchPages > MaxBufferedPagesPerBucket)
         {
             errors.Add($"{nameof(MaxParallelPartitions)} x {nameof(PrefetchPages)} must be at most {MaxBufferedPagesPerBucket:N0} to bound memory (was {MaxParallelPartitions:N0} x {PrefetchPages:N0} = {(long)MaxParallelPartitions * PrefetchPages:N0}).");

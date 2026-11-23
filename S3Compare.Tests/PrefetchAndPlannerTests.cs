@@ -214,7 +214,9 @@ public class PartitionPlannerTests
         Assert.Equal(32, ranges.Count);
         AssertTilesAndCovers(ranges, keysA.Concat(keysB));
         Assert.All(ranges.Where(r => r.Upper != null), r => Assert.EndsWith("/", r.Upper));
-        Assert.Equal(2, lister.CallCount);   // one delimiter listing per bucket was enough
+        // The root listing per bucket, then (affordable within half of the budget) one listing per folder: 20 on A, 20 on B.
+        // Planning used to stop after the root once it had 40 candidates; it now descends so big folders contribute boundaries.
+        Assert.Equal(2 + 40, lister.CallCount);
     }
 
     [Fact]

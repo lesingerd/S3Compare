@@ -7,6 +7,9 @@ namespace S3Compare.App.Services;
 /// <summary>A bucket as seen by the planner: its lister, name, prefix, request throttle and a short label ("A"/"B") for diagnostics.</summary>
 public sealed record PlannerBucket(IS3Lister Lister, string BucketName, string Prefix, TokenBucketRateLimiter? RateLimiter = null, string Label = "");
 
+/// <summary>The ranges of a plan and the sorted boundary candidates (relative keys) they were built from.</summary>
+public sealed record PlanResult(List<ScanPartition> Ranges, IReadOnlyList<string> Candidates);
+
 /// <summary>Limits, concurrency and reporting hooks of one planning run. The defaults apply no time box.</summary>
 public sealed class PlannerOptions
 {
@@ -21,6 +24,9 @@ public sealed class PlannerOptions
 
     /// <summary>Independent planner requests in flight per bucket (the request budget and the rate limiter still apply).</summary>
     public int Concurrency { get; init; } = DefaultConcurrency;
+
+    /// <summary>Folder levels listed at most (0 = none: probes only).</summary>
+    public int MaxDiscoveryDepth { get; init; } = PartitionPlanner.MaxDiscoveryDepth;
 
     /// <summary>Called a few times per second (and on every state change of note) from a background thread.</summary>
     public Action<PlannerProgress>? OnProgress { get; init; }
@@ -89,6 +95,21 @@ public static class PartitionPlanner
         string? afterRelativeKey = null,
         Func<CancellationToken, Task>? waitIfPaused = null,
         PlannerOptions? options = null)
+        => (await PlanWithCandidatesAsync(bucketA, bucketB, targetPartitions, maxDiscoveryRequests, cancellationToken, afterRelativeKey, waitIfPaused, options).ConfigureAwait(false)).Ranges;
+
+    /// <summary>
+    /// <see cref="PlanAsync"/> that also returns the distinct boundary candidates (relative keys, sorted, after the resume key)
+    /// the ranges were built from. <see cref="RangeSplitter"/> uses them.
+    /// </summary>
+    public static async Task<PlanResult> PlanWithCandidatesAsync(
+        PlannerBucket bucketA,
+        PlannerBucket bucketB,
+        int targetPartitions,
+        int maxDiscoveryRequests,
+        CancellationToken cancellationToken = default,
+        string? afterRelativeKey = null,
+        Func<CancellationToken, Task>? waitIfPaused = null,
+        PlannerOptions? options = null)
     {
         string? after = string.IsNullOrEmpty(afterRelativeKey) ? null : afterRelativeKey;
         options ??= new PlannerOptions();
@@ -111,17 +132,25 @@ public static class PartitionPlanner
                 // 1. Hierarchical discovery, one level at a time on both buckets concurrently, until the union has enough candidates
                 var levelA = new List<string> { string.Empty };
                 var levelB = new List<string> { string.Empty };
-                for (int depth = 1; depth <= MaxDiscoveryDepth && (levelA.Count > 0 || levelB.Count > 0) && !context.Stopped; depth++)
+                int maxDepth = Math.Max(0, options.MaxDiscoveryDepth);
+                for (int depth = 1; depth <= maxDepth && (levelA.Count > 0 || levelB.Count > 0) && !context.Stopped; depth++)
                 {
-                    var nextA = ListFoldersAsync(bucketA, levelA, depth, budget, context);
-                    var nextB = ListFoldersAsync(bucketB, levelB, depth, budget, context);
+                    var nextA = ListFoldersAsync(bucketA, levelA, depth, maxDepth, budget, context);
+                    var nextB = ListFoldersAsync(bucketB, levelB, depth, maxDepth, budget, context);
                     await Task.WhenAll(nextA, nextB).ConfigureAwait(false);
 
                     candidates.UnionWith(nextA.Result);
                     candidates.UnionWith(nextB.Result);
                     context.AddCandidates(nextA.Result);
                     context.AddCandidates(nextB.Result);
-                    if (context.CountUsable(candidates) >= targetPartitions || budget.Remaining <= 0) break;
+                    if (budget.Remaining <= 0) break;
+                    // Keep descending even when there are enough candidates: the ranges are spaced evenly over the candidates, so a
+                    // folder with thousands of subfolders must contribute them, or one range ends up holding most of the bucket (a few
+                    // near-empty top folders each with one big subfolder). Only stop early when listing the next level (one request
+                    // per folder found, on the bucket that has it) would take more than half of the remaining budget: a partly listed
+                    // level would skew the plan towards its first folders, and the probe fallback keeps the other half. Uneven ranges
+                    // that remain are split while scanning (see RangeSplitter).
+                    if (context.CountUsable(candidates) >= targetPartitions && (long)(nextA.Result.Count + nextB.Result.Count) > budget.Remaining / 2) break;
 
                     levelA = nextA.Result;
                     levelB = nextB.Result;
@@ -147,7 +176,7 @@ public static class PartitionPlanner
             ranges[0].LastCompletedKey = after;
             context.SetStep("Building ranges");
             context.Finish(ranges.Count, targetPartitions);
-            return ranges;
+            return new PlanResult(ranges, candidates.Where(context.IsUsable).OrderBy(c => c, Utf8KeyComparer.Instance).ToList());
         }
         finally
         {
@@ -215,14 +244,14 @@ public static class PartitionPlanner
     }
 
     /// <summary>Delimiter listings of the given folders (relative), several at a time; returns their relative sub-folders.</summary>
-    private static async Task<List<string>> ListFoldersAsync(PlannerBucket bucket, List<string> folders, int depth, RequestBudget budget, PlanContext context)
+    private static async Task<List<string>> ListFoldersAsync(PlannerBucket bucket, List<string> folders, int depth, int maxDepth, RequestBudget budget, PlanContext context)
     {
         var found = new ConcurrentBag<string>();
         // Coarse to fine, so a budget that runs out still samples folders across the whole level
         var ordered = CoarseToFine(folders.Where(context.MayHoldKeysAfter).ToList()).ToList();
         if (ordered.Count == 0) return new List<string>();
 
-        context.SetStep(bucket, $"delimiter depth {depth}/{MaxDiscoveryDepth} ({ordered.Count:N0} folders)");
+        context.SetStep(bucket, $"delimiter depth {depth}/{maxDepth} ({ordered.Count:N0} folders)");
         using var gate = new SemaphoreSlim(context.Concurrency);
         var tasks = new List<Task>();
         foreach (var folder in ordered)

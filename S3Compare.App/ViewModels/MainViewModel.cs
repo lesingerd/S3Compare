@@ -73,6 +73,7 @@ public class MainViewModel : INotifyPropertyChanged
     private int _maxConcurrentContentChecks = ScanPerformanceOptions.DefaultMaxConcurrentContentChecks;
     private int _maxDiscoveryRequests = ScanPerformanceOptions.DefaultMaxDiscoveryRequests;
     private int _maxPlanningSeconds = ScanPerformanceOptions.DefaultMaxPlanningSeconds;
+    private bool _enableRangeSplitting = true;
 
     // Checkpoint & Resume state (NO credentials/keys saved)
     private bool _hasResumableCheckpoint = false;
@@ -445,6 +446,12 @@ public class MainViewModel : INotifyPropertyChanged
         set => SetField(ref _maxPlanningSeconds, value);
     }
 
+    public bool EnableRangeSplitting
+    {
+        get => _enableRangeSplitting;
+        set => SetField(ref _enableRangeSplitting, value);
+    }
+
     public ScanPerformanceOptions BuildPerformanceOptions() => new()
     {
         MaxParallelPartitions = MaxParallelPartitions,
@@ -453,7 +460,8 @@ public class MainViewModel : INotifyPropertyChanged
         MaxObjectsPerSecond = MaxObjectsPerSecond,
         MaxConcurrentContentChecks = MaxConcurrentContentChecks,
         MaxDiscoveryRequests = MaxDiscoveryRequests,
-        MaxPlanningSeconds = MaxPlanningSeconds
+        MaxPlanningSeconds = MaxPlanningSeconds,
+        EnableRangeSplitting = EnableRangeSplitting
     };
 
     public bool HasResumableCheckpoint
@@ -949,7 +957,7 @@ public class MainViewModel : INotifyPropertyChanged
             "Planning" => $"Planning key-range partitions: {stats.Planner?.Summary ?? "starting"}",
             "Finalizing" => $"Finalizing: {stats.LatestStep}",
             "Starting" => stats.LatestStep,
-            _ => $"{stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | Partitions: {stats.PartitionsCompleted:N0}/{stats.PartitionsTotal:N0} done, {stats.ActivePartitions} active | RAM: {stats.WorkingSetMB:F0} MB"
+            _ => $"{stats.ObjectsCompared:N0} items evaluated ({stats.ItemsPerSecond:N1} items/sec) | Partitions: {stats.PartitionsCompleted:N0}/{stats.PartitionsTotal:N0} done, {stats.ActivePartitions} active{(stats.PartitionSplits > 0 ? $", {stats.PartitionSplits} split" : string.Empty)} | RAM: {stats.WorkingSetMB:F0} MB"
         };
         if (stats.IsPaused && stats.Phase == "Planning") text = "(planner waits while paused) " + text;
         return $"[{phase}] {text}{stall}";
