@@ -52,12 +52,15 @@ public class MainWindowTests
                 Assert.Equal(8, defaults.MaxConcurrentContentChecks);
                 Assert.Equal(500, defaults.MaxDiscoveryRequests);
                 Assert.Equal(60, defaults.MaxPlanningSeconds);
+                Assert.True(defaults.EnableRangeSplitting);
                 Assert.Empty(defaults.Validate());
 
                 vm.MaxParallelPartitions = 0;
                 vm.MaxObjectsPerSecond = 2500;
                 var changed = vm.BuildPerformanceOptions();
                 Assert.Equal(2500, changed.MaxObjectsPerSecond);
+                vm.EnableRangeSplitting = false;
+                Assert.False(vm.BuildPerformanceOptions().EnableRangeSplitting);
                 Assert.Single(changed.Validate());
             }
             catch (Exception ex)

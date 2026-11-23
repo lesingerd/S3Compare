@@ -29,7 +29,7 @@ public static class DiagnosticsFormatter
             if (!string.IsNullOrEmpty(p.DisabledTechniques)) sb.AppendLine($"  disabled       : {p.DisabledTechniques}");
             if (!string.IsNullOrEmpty(p.LastError)) sb.AppendLine($"  last issue     : {p.LastError}");
         }
-        sb.AppendLine($"Partitions       : {s.PartitionsCompleted:N0}/{s.PartitionsTotal:N0} done, {s.ActivePartitions} running");
+        sb.AppendLine($"Partitions       : {s.PartitionsCompleted:N0}/{s.PartitionsTotal:N0} done, {s.ActivePartitions} running{(s.PartitionSplits > 0 ? $", {s.PartitionSplits} split by idle workers" : string.Empty)}");
         AppendBucket(sb, "LIST bucket A", s.BucketAList);
         AppendBucket(sb, "LIST bucket B", s.BucketBList);
         sb.AppendLine($"Total LIST reqs  : {s.TotalListRequests:N0}   rate-limiter wait: {s.RateLimiterWaitSeconds:N1}s total");

@@ -713,6 +713,10 @@
                                 <TextBlock Text="Planning time limit (s):" VerticalAlignment="Center" Foreground="#94A3B8" FontSize="11" Margin="0,0,4,0"/>
                                 <TextBox Text="{Binding MaxPlanningSeconds, UpdateSourceTrigger=PropertyChanged}"
                                          ToolTip="MaxPlanningSeconds (default 60, 0 = unlimited): planning time box. When exceeded the planner stops sending requests and builds key ranges from the boundaries found so far (fewer, larger ranges; the scan still covers every key). Time spent paused does not count."/>
+
+                                <CheckBox IsChecked="{Binding EnableRangeSplitting}" Content="Split running ranges" VerticalAlignment="Center"
+                                          Foreground="#94A3B8" FontSize="11" Margin="0,2,14,2" IsEnabled="{Binding CanEditConfig}"
+                                          ToolTip="EnableRangeSplitting (default on): work stealing. A worker with no queued range left splits the unfinished part of a running range and takes the second half, so one big range cannot leave the other workers idle. It costs a few extra LIST requests per split and never changes which differences are found."/>
                             </WrapPanel>
                         </Border>
                     </Expander>

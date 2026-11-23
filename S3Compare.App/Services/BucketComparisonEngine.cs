@@ -74,6 +74,8 @@ public class BucketComparisonEngine
     private volatile string _currentKeyA = "-";
     private volatile string _currentKeyB = "-";
     private int _activePartitions;
+    private readonly object _stateLock = new(); // guards _ranges and the live state of its ranges (Upper, Active, InFlightKey, ...)
+    private int _splitCount;
     private readonly StreamReadCounters _readA = new();
     private readonly StreamReadCounters _readB = new();
     private readonly SemaphoreSlim _contentChecks;
@@ -94,8 +96,6 @@ public class BucketComparisonEngine
     private volatile string _latestStep = "-";
     private readonly IssueLog _issues = new();
     private volatile ScanDiagnosticsLogger? _diag;
-    private readonly ConcurrentDictionary<int, byte> _runningRanges = new();
-    private long[] _rangeObjects = Array.Empty<long>();
     private long _lastHeartbeatLogMs;
 
     // Abandon support: the writer applies a batch under _writerGate; once abandoned it applies nothing more
@@ -129,7 +129,7 @@ public class BucketComparisonEngine
     internal Func<Task>? FinalizeHook { get; set; }
 
     /// <summary>The partition plan of the current (or last) run, with progress. Snapshot copy.</summary>
-    public IReadOnlyList<ScanPartition> CurrentPlan => _ranges.Select(r => r.Clone()).ToList();
+    public IReadOnlyList<ScanPartition> CurrentPlan { get { lock (_stateLock) return _ranges.Select(r => r.Clone()).ToList(); } }
 
     public BucketComparisonEngine(
         S3BucketConfig configA,
@@ -360,14 +360,18 @@ public class BucketComparisonEngine
             _phase = "Planning";
             SetStep("Planning key-range partitions");
             RaiseProgress();
-            _ranges = await BuildPlanAsync(listerA, listerB, scanCts.Token).ConfigureAwait(false);
-            _rangeObjects = new long[_ranges.Count];
-            SetStep($"Plan ready: {_ranges.Count:N0} range(s), {_ranges.Count(r => r.Completed):N0} already complete");
+            var plannedRanges = await BuildPlanAsync(listerA, listerB, scanCts.Token).ConfigureAwait(false);
+            lock (_stateLock)
+            {
+                _ranges = plannedRanges;
+                _splitCount = 0;
+            }
+            SetStep($"Plan ready: {plannedRanges.Count:N0} range(s), {plannedRanges.Count(r => r.Completed):N0} already complete");
 
             if (diagnosticsLogger != null)
             {
                 await diagnosticsLogger.LogInfoAsync(
-                    $"Partition plan: {_ranges.Count} range(s), {_ranges.Count(r => r.Completed)} already complete; " +
+                    $"Partition plan: {plannedRanges.Count} range(s), {plannedRanges.Count(r => r.Completed)} already complete; " +
                     $"MaxParallelPartitions={_options.MaxParallelPartitions}, PrefetchPages={_options.PrefetchPages}, " +
                     $"MaxListRequestsPerSecond={_options.MaxListRequestsPerSecond}, MaxObjectsPerSecond={_options.MaxObjectsPerSecond}, " +
                     $"MaxConcurrentContentChecks={_options.MaxConcurrentContentChecks}").ConfigureAwait(false);
@@ -383,10 +387,39 @@ public class BucketComparisonEngine
 
             _phase = "Scanning";
             SetStep($"Scanning: starting up to {_options.MaxParallelPartitions} worker(s)");
-            var pending = new ConcurrentQueue<int>(Enumerable.Range(0, _ranges.Count).Where(i => !_ranges[i].Completed));
-            var plan = _ranges.Select(r => r.Clone()).ToArray();
-            int workerCount = Math.Min(_options.MaxParallelPartitions, pending.Count);
+            ConcurrentQueue<ScanPartition> pending;
+            lock (_stateLock) pending = new ConcurrentQueue<ScanPartition>(_ranges.Where(r => !r.Completed));
+            // With work stealing every configured worker runs even when fewer ranges are left (a resumed plan, a lopsided
+            // plan): the idle ones split the running ranges.
+            bool splitting = SplittingEnabled;
+            int workerCount = pending.IsEmpty ? 0 : Math.Min(_options.MaxParallelPartitions, splitting ? int.MaxValue : pending.Count);
+            if (splitting && workerCount > 0)
+            {
+                diagnosticsLogger?.Log($"Work stealing: {workerCount} worker(s) for {pending.Count} unfinished key range(s); idle workers split running ranges.");
+            }
             Exception? firstError = null;
+            int busyWorkers = 0; // workers holding (or about to hold, or splitting for) a range
+
+            // Runs one range; false when it failed for real (the whole scan is then being stopped)
+            async Task<bool> RunRangeGuardedAsync(ScanPartition range, ObjectTokenAccount objectTokens)
+            {
+                try
+                {
+                    await ProcessRangeAsync(range, listerA, listerB, commitChannel.Writer, objectTokens, scanCts.Token).ConfigureAwait(false);
+                    return true;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !scanCts.IsCancellationRequested)
+                {
+                    // A real failure in one range stops the whole scan
+                    int index;
+                    lock (_stateLock) index = _ranges.IndexOf(range);
+                    if (_writerError == null) _issues.Add(IssueOutcome.Failed, $"range {index}: {ex.GetType().Name}: {ex.Message} \u2014 the scan was stopped; a checkpoint is kept so it can be resumed");
+                    diagnosticsLogger?.Log($"Worker failed on range {index}: {ex.GetType().Name}: {ex.Message}");
+                    Interlocked.CompareExchange(ref firstError, ex, null);
+                    try { scanCts.Cancel(); } catch (ObjectDisposedException) { }
+                    return false;
+                }
+            }
 
             var workers = new Task[workerCount];
             for (int w = 0; w < workerCount; w++)
@@ -395,21 +428,58 @@ public class BucketComparisonEngine
                 {
                     // Object-rate tokens are owed per worker, across ranges, so many small ranges are still throttled
                     var objectTokens = new ObjectTokenAccount();
-                    while (pending.TryDequeue(out int index))
+                    while (true)
                     {
+                        // Counted before the dequeue, so an idle worker never sees "nothing queued, nobody busy" while a range is
+                        // being handed to a worker that has not marked it active yet. Idle workers are woken only after the count
+                        // drops, or they could see this worker still busy, go back to sleep and delay the end of the scan.
+                        bool ran = false;
+                        bool failed = false;
+                        Interlocked.Increment(ref busyWorkers);
                         try
                         {
-                            await ProcessRangeAsync(index, plan[index], listerA, listerB, commitChannel.Writer, objectTokens, scanCts.Token).ConfigureAwait(false);
+                            if (pending.TryDequeue(out var range))
+                            {
+                                ran = true;
+                                if (await RunRangeGuardedAsync(range, objectTokens).ConfigureAwait(false)) continue;
+                                failed = true;
+                            }
                         }
-                        catch (Exception ex) when (ex is not OperationCanceledException || !scanCts.IsCancellationRequested)
+                        finally
                         {
-                            // A real failure in one range stops the whole scan
-                            if (_writerError == null) _issues.Add(IssueOutcome.Failed, $"range {index}: {ex.GetType().Name}: {ex.Message} \u2014 the scan was stopped; a checkpoint is kept so it can be resumed");
-                            diagnosticsLogger?.Log($"Worker failed on range {index}: {ex.GetType().Name}: {ex.Message}");
-                            Interlocked.CompareExchange(ref firstError, ex, null);
-                            try { scanCts.Cancel(); } catch (ObjectDisposedException) { }
-                            return;
+                            // Wake idle workers after a range, and whenever nobody holds one any more (the last check of an idle
+                            // worker may be what kept the count up while the last range ended).
+                            if (Interlocked.Decrement(ref busyWorkers) == 0 || ran) SignalRangeEnded();
                         }
+                        if (failed) return;
+                        if (!splitting) break;
+
+                        // Nothing queued: take the second half of a running range, wait for one to become splittable, or finish
+                        // when no worker holds a range any more (then no new range can appear). Looking for a split does not
+                        // count as busy: the range being split is held by its own worker until it ends.
+                        await WaitWhilePausedAsync(scanCts.Token).ConfigureAwait(false);
+                        var wake = Volatile.Read(ref _rangeEnded).Task; // read before the checks, so a range ending meanwhile is not missed
+                        var (stolen, attempted) = await TrySplitRangeAsync(listerA!, listerB!, scanCts.Token).ConfigureAwait(false);
+                        if (stolen != null)
+                        {
+                            Interlocked.Increment(ref busyWorkers);
+                            bool ok;
+                            try
+                            {
+                                ok = await RunRangeGuardedAsync(stolen, objectTokens).ConfigureAwait(false);
+                            }
+                            finally
+                            {
+                                Interlocked.Decrement(ref busyWorkers);
+                                SignalRangeEnded();
+                            }
+                            if (!ok) return;
+                            continue;
+                        }
+                        if (attempted) SignalRangeEnded(); // a failed attempt backs its range off; others may try a different one
+                        if (Volatile.Read(ref busyWorkers) == 0 && pending.IsEmpty) break;
+                        await Task.WhenAny(wake, Task.Delay(_options.SplitIdlePoll, scanCts.Token)).ConfigureAwait(false);
+                        scanCts.Token.ThrowIfCancellationRequested();
                     }
 
                     // Charge what is left below a full batch
@@ -626,6 +696,7 @@ public class BucketComparisonEngine
         var plannerOptions = new PlannerOptions
         {
             MaxDuration = TimeSpan.FromSeconds(_options.MaxPlanningSeconds),
+            MaxDiscoveryDepth = _options.MaxDiscoveryDepth,
             OnProgress = progress =>
             {
                 _plannerProgress = progress;
@@ -705,7 +776,7 @@ public class BucketComparisonEngine
         string? path = null;
         try
         {
-            if (gotGate && !alreadyAbandoned && CanCheckpoint && !_checkpointUnsafe && _ranges.Any(r => r.Completed || r.LastCompletedKey != null))
+            if (gotGate && !alreadyAbandoned && CanCheckpoint && !_checkpointUnsafe && HasRangeProgress())
             {
                 try
                 {
@@ -746,7 +817,123 @@ public class BucketComparisonEngine
 
     private static string? NullIfEmpty(string? s) => string.IsNullOrEmpty(s) ? null : s;
 
-    private (IS3ObjectStream A, IS3ObjectStream B) CreateStreams(ScanPartition range, IS3Lister? listerA, IS3Lister? listerB, CancellationToken cancellationToken)
+    private bool SplittingEnabled => _options.EnableRangeSplitting && _providedStreamA == null && _options.MaxParallelPartitions > 1;
+
+    /// <summary>Split attempts that found no key in a row before a range is left alone for good.</summary>
+    private const int MaxSplitFailures = 6;
+
+    /// <summary>Completed (and replaced) whenever a worker leaves a range, so idle workers re-check at once instead of at the next poll.</summary>
+    private TaskCompletionSource _rangeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void SignalRangeEnded() =>
+        Interlocked.Exchange(ref _rangeEnded, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
+
+    /// <summary>
+    /// Work stealing: picks the running range left alone longest (running, or last split, at least
+    /// <see cref="ScanPerformanceOptions.MinRangeAgeForSplit"/> ago), finds a key ahead of its worker that cuts the rest in two, and - under the
+    /// state lock, only if the worker has not reached that key yet - lowers the range's upper bound to it and inserts the
+    /// second half as a new range right after it, which the calling worker then runs. Range is null when nothing was split;
+    /// Attempted is false when no range was eligible (nothing was sent).
+    /// A failed attempt backs off (10 s, doubling, up to 2 min) and after <see cref="MaxSplitFailures"/> in a row the range
+    /// is left alone. Never throws except for cancellation: a split is an optimisation only.
+    /// </summary>
+    private async Task<(ScanPartition? Range, bool Attempted)> TrySplitRangeAsync(IS3Lister listerA, IS3Lister listerB, CancellationToken ct)
+    {
+        ScanPartition? victim;
+        string? position, upper;
+        long now = _stopwatch.ElapsedMilliseconds;
+        long minAge = (long)_options.MinRangeAgeForSplit.TotalMilliseconds;
+        lock (_stateLock)
+        {
+            victim = _ranges
+                .Where(r => r.Active && !r.Completed && !r.Splitting && r.SplitFailures < MaxSplitFailures
+                    && now >= r.NextSplitAttemptMs && now - r.ActiveSinceMs >= minAge)
+                .OrderBy(r => r.ActiveSinceMs) // the range left alone longest: splits rotate over the running ranges
+                .FirstOrDefault();
+            if (victim == null) return (null, false);
+            victim.Splitting = true;
+            position = victim.InFlightKey ?? victim.LastCompletedKey ?? victim.Lower;
+            upper = victim.Upper;
+        }
+
+        var sw = Stopwatch.StartNew();
+        var splitter = new RangeSplitter(
+            new RangeSplitter.Side(listerA, _configA!.BucketName, _prefixA, _limiterA),
+            new RangeSplitter.Side(listerB, _configB!.BucketName, _prefixB, _limiterB),
+            _options.SplitRequestTimeout,
+            WaitWhilePausedAsync);
+        string? key = null;
+        try
+        {
+            key = await splitter.FindSplitAsync(position, upper, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            lock (_stateLock) victim.Splitting = false;
+            throw;
+        }
+        catch (Exception ex)
+        {
+            key = null;
+            _issues.Add(IssueOutcome.Skipped, $"splitting a running key range failed ({ex.GetType().Name}: {ex.Message}); the range keeps running on one worker — results unaffected");
+        }
+
+        ScanPartition? created = null;
+        string rejected = "no split key found";
+        int index = -1;
+        string? lower;
+        long nextAttemptInMs = 0;
+        bool givingUp = false;
+        lock (_stateLock)
+        {
+            victim.Splitting = false;
+            lower = victim.Lower;
+            if (key != null)
+            {
+                // Re-check against the live state: the worker kept going while the split key was looked up.
+                string? done = victim.InFlightKey ?? victim.LastCompletedKey ?? victim.Lower;
+                if (victim.Completed || !victim.Active) rejected = "the range finished meanwhile";
+                else if (done != null && Utf8KeyComparer.Instance.Compare(key, done) <= 0) rejected = "the worker passed the split key meanwhile";
+                else if (victim.Lower != null && Utf8KeyComparer.Instance.Compare(key, victim.Lower) <= 0) rejected = "split key not inside the range";
+                else if (victim.Upper != null && Utf8KeyComparer.Instance.Compare(key, victim.Upper) >= 0) rejected = "split key not inside the range";
+                else
+                {
+                    index = _ranges.IndexOf(victim);
+                    created = new ScanPartition { Lower = key, Upper = victim.Upper, CreatedBySplit = true };
+                    victim.Upper = key;
+                    _ranges.Insert(index + 1, created);
+                    _splitCount++;
+                    victim.SplitFailures = 0;
+                    victim.ActiveSinceMs = _stopwatch.ElapsedMilliseconds; // both halves now wait MinRangeAgeForSplit before the next split
+                }
+            }
+            if (created == null)
+            {
+                victim.SplitFailures++;
+                long backoff = Math.Min(120_000, 10_000L << Math.Min(victim.SplitFailures - 1, 4));
+                victim.NextSplitAttemptMs = _stopwatch.ElapsedMilliseconds + backoff;
+                nextAttemptInMs = backoff;
+                givingUp = victim.SplitFailures >= MaxSplitFailures;
+            }
+        }
+
+        string cost = $"{splitter.RequestsUsed} request(s){(splitter.RequestErrors > 0 ? $", {splitter.RequestErrors} skipped" : string.Empty)}, {sw.ElapsedMilliseconds} ms";
+        if (created != null)
+        {
+            _diag?.Log($"Split key range #{index}: an idle worker took ({Clip(key!)}, {Clip(created.Upper ?? "(end)")}] from the running range, which now ends at '{Clip(key!)}' (method {splitter.Method}, {cost}).");
+        }
+        else
+        {
+            if (splitter.RequestErrors > 0 && splitter.LastError != null)
+                _issues.Add(IssueOutcome.Skipped, $"{splitter.LastError} — the running range was not split this time; results unaffected");
+            _diag?.Log($"Split of key range ({Clip(lower ?? "(start)")}, ...] not done: {rejected} ({cost}); next attempt in {nextAttemptInMs / 1000} s{(givingUp ? " (giving up on this range)" : string.Empty)}.");
+        }
+        return (created, true);
+    }
+
+    private static string Clip(string value) => value.Length <= 40 ? value : value[..37] + "...";
+
+    private (IS3ObjectStream A, IS3ObjectStream B) CreateStreams(string? resumeAfter, string? upper, IS3Lister? listerA, IS3Lister? listerB, CancellationToken cancellationToken)
     {
         if (_providedStreamA != null)
         {
@@ -755,12 +942,11 @@ public class BucketComparisonEngine
             return (_providedStreamA, _providedStreamB!);
         }
 
-        string? resumeAfter = range.LastCompletedKey ?? range.Lower;
         var streamA = new PrefetchingObjectStream(
-            listerA!, _configA!.BucketName, _prefixA, BuildStartAfter(_prefixA, resumeAfter), range.Upper,
+            listerA!, _configA!.BucketName, _prefixA, BuildStartAfter(_prefixA, resumeAfter), upper,
             _options.PrefetchPages, _limiterA, page => RaisePageLoaded(PageLoadedA, ref _lastPageEventA, page), _readA, ListPageSize, cancellationToken);
         var streamB = new PrefetchingObjectStream(
-            listerB!, _configB!.BucketName, _prefixB, BuildStartAfter(_prefixB, resumeAfter), range.Upper,
+            listerB!, _configB!.BucketName, _prefixB, BuildStartAfter(_prefixB, resumeAfter), upper,
             _options.PrefetchPages, _limiterB, page => RaisePageLoaded(PageLoadedB, ref _lastPageEventB, page), _readB, ListPageSize, cancellationToken);
         return (streamA, streamB);
     }
@@ -778,7 +964,6 @@ public class BucketComparisonEngine
 
     /// <summary>Merge-join of one key range. Each fully processed key is committed atomically (see <see cref="CommitBatch"/>).</summary>
     private async Task ProcessRangeAsync(
-        int rangeIndex,
         ScanPartition range,
         IS3Lister? listerA,
         IS3Lister? listerB,
@@ -786,22 +971,43 @@ public class BucketComparisonEngine
         ObjectTokenAccount objectTokens,
         CancellationToken cancellationToken)
     {
-        Interlocked.Increment(ref _activePartitions);
-        _runningRanges[rangeIndex] = 0;
-        var work = new RangeWork(rangeIndex, range.LastCompletedKey);
+        // Not active yet, so no split can change the range until it is marked active below
+        string? startKey, lowerKey, upperKey;
+        bool createdBySplit;
+        lock (_stateLock)
+        {
+            startKey = range.LastCompletedKey;
+            lowerKey = range.Lower;
+            upperKey = range.Upper;
+            createdBySplit = range.CreatedBySplit;
+        }
+        var work = new RangeWork(range, startKey);
         IS3ObjectStream? enumA = null;
         IS3ObjectStream? enumB = null;
         bool ownsStreams = _providedStreamA == null;
+        bool marked = false;
         try
         {
-            (enumA, enumB) = CreateStreams(range, listerA, listerB, cancellationToken);
+            string? resumeAfter = startKey ?? lowerKey;
+            (enumA, enumB) = CreateStreams(resumeAfter, upperKey, listerA, listerB, cancellationToken);
             var gapDetector = _detectSequenceGaps ? new SequenceGapDetector(_maxSequenceGapThreshold) : null;
-            if (gapDetector != null && range.LastCompletedKey != null)
+            // A resumed range continues the numeric series of the key it stopped after, as an uninterrupted run would. The second
+            // half of a split continues the series of the key where the first half now ends.
+            string? primeKey = startKey ?? (createdBySplit ? lowerKey : null);
+            if (gapDetector != null && primeKey != null)
             {
-                // A resumed range continues the numeric series of the key it stopped after, as an uninterrupted run would
                 long unusedIds = 0;
-                gapDetector.CheckKey(range.LastCompletedKey, ref unusedIds);
+                gapDetector.CheckKey(primeKey, ref unusedIds);
             }
+
+            lock (_stateLock)
+            {
+                range.Active = true;
+                range.ActiveSinceMs = _stopwatch.ElapsedMilliseconds;
+                range.InFlightKey = resumeAfter;
+            }
+            marked = true;
+            Interlocked.Increment(ref _activePartitions);
 
             bool hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
             bool hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
@@ -822,6 +1028,18 @@ public class BucketComparisonEngine
                 int cmp = itemB == null ? -1
                     : itemA == null ? 1
                     : Utf8KeyComparer.Instance.Compare(relA, relB);
+
+                // A split may have lowered the range's upper bound (the rest now belongs to another worker). The key about to be
+                // processed is the smaller head, so once it is past the bound, both listings are: the range is finished. The
+                // check and the in-flight key are set under the state lock, which is where a split checks its key against them.
+                string nextKey = cmp <= 0 ? relA! : relB!;
+                bool pastUpper;
+                lock (_stateLock)
+                {
+                    pastUpper = range.Upper != null && Utf8KeyComparer.Instance.Compare(nextKey, range.Upper) > 0;
+                    if (!pastUpper) range.InFlightKey = nextKey;
+                }
+                if (pastUpper) break;
 
                 string processedRelativeKey;
                 if (cmp == 0)
@@ -902,8 +1120,11 @@ public class BucketComparisonEngine
                 if (enumA != null) await enumA.DisposeAsync().ConfigureAwait(false);
                 if (enumB != null) await enumB.DisposeAsync().ConfigureAwait(false);
             }
-            Interlocked.Decrement(ref _activePartitions);
-            _runningRanges.TryRemove(rangeIndex, out _);
+            if (marked)
+            {
+                Interlocked.Decrement(ref _activePartitions);
+                lock (_stateLock) range.Active = false;
+            }
         }
     }
 
@@ -1015,10 +1236,13 @@ public class BucketComparisonEngine
                     }
 
                     _totals.Add(batch.Delta);
-                    var range = _ranges[batch.RangeIndex];
-                    if (batch.LastCompletedKey != null) range.LastCompletedKey = batch.LastCompletedKey;
-                    if (batch.Completed) range.Completed = true;
-                    if (batch.RangeIndex < _rangeObjects.Length) _rangeObjects[batch.RangeIndex] += batch.Delta.ObjectsCompared;
+                    lock (_stateLock)
+                    {
+                        var range = batch.Range;
+                        if (batch.LastCompletedKey != null) range.LastCompletedKey = batch.LastCompletedKey;
+                        if (batch.Completed) range.Completed = true;
+                        range.ObjectsCompared += batch.Delta.ObjectsCompared;
+                    }
                     _itemsSinceCheckpoint += batch.Delta.ObjectsCompared;
 
                     await TickAsync(diagnosticsLogger).ConfigureAwait(false);
@@ -1076,7 +1300,7 @@ public class BucketComparisonEngine
 
     private async Task SaveCheckpointIfNeededAsync(ScanDiagnosticsLogger? diagnosticsLogger)
     {
-        if (!CanCheckpoint || _checkpointUnsafe || _abandoned || !_ranges.Any(r => r.Completed || r.LastCompletedKey != null))
+        if (!CanCheckpoint || _checkpointUnsafe || _abandoned || !HasRangeProgress())
             return;
 
         try
@@ -1105,7 +1329,8 @@ public class BucketComparisonEngine
 
     private ScanCheckpoint CreateCheckpointSnapshot()
     {
-        var partitions = _ranges.Select(r => r.Clone()).ToList();
+        List<ScanPartition> partitions;
+        lock (_stateLock) partitions = _ranges.Select(r => r.Clone()).ToList();
         bool singleUnbounded = partitions.Count == 1 && partitions[0].Lower == null && partitions[0].Upper == null;
 
         return new ScanCheckpoint
@@ -1370,31 +1595,42 @@ public class BucketComparisonEngine
             _diag?.Log($"Issue: {entry.Display}");
     }
 
-    /// <summary>Plan with per-range state, for the diagnostics table. Ranges are only mutated (never added), so reading them from another thread is safe enough for display.</summary>
-    private List<PartitionStatus> SnapshotPartitions()
+    /// <summary>True when any range has completed keys (so a checkpoint is worth saving).</summary>
+    private bool HasRangeProgress()
     {
-        var ranges = _ranges;
-        var objects = _rangeObjects;
-        var list = new List<PartitionStatus>(ranges.Count);
-        for (int i = 0; i < ranges.Count; i++)
+        lock (_stateLock) return _ranges.Any(r => r.Completed || r.LastCompletedKey != null);
+    }
+
+    /// <summary>Plan with per-range state, for the diagnostics table (read under the state lock: a split inserts ranges while the scan runs).</summary>
+    private List<PartitionStatus> SnapshotPartitions(out int rangeCount, out int rangesDone, out int splits)
+    {
+        lock (_stateLock)
         {
-            var r = ranges[i];
-            list.Add(new PartitionStatus
+            rangeCount = _ranges.Count;
+            rangesDone = _ranges.Count(r => r.Completed);
+            splits = _splitCount;
+            var list = new List<PartitionStatus>(_ranges.Count);
+            for (int i = 0; i < _ranges.Count; i++)
             {
-                Index = i,
-                Lower = r.Lower ?? "(start)",
-                Upper = r.Upper ?? "(end)",
-                State = r.Completed ? "Done" : _runningRanges.ContainsKey(i) ? "Running" : "Pending",
-                LastCompletedKey = r.LastCompletedKey ?? "-",
-                ObjectsCompared = i < objects.Length ? Interlocked.Read(ref objects[i]) : 0
-            });
+                var r = _ranges[i];
+                list.Add(new PartitionStatus
+                {
+                    Index = i,
+                    Lower = r.Lower ?? "(start)",
+                    Upper = r.Upper ?? "(end)",
+                    State = r.Completed ? "Done" : r.Active ? "Running" : "Pending",
+                    LastCompletedKey = r.LastCompletedKey ?? "-",
+                    ObjectsCompared = r.ObjectsCompared
+                });
+            }
+            return list;
         }
-        return list;
     }
 
     private ComparisonStatistics CloneStats()
     {
         double elapsedSeconds = TotalElapsedSeconds();
+        var partitionRows = SnapshotPartitions(out int rangeCount, out int rangesDone, out int splits);
         var stats = new ComparisonStatistics
         {
             ElapsedTime = TimeSpan.FromSeconds(elapsedSeconds),
@@ -1407,14 +1643,15 @@ public class BucketComparisonEngine
             LastCheckpointKey = _lastCheckpointDisplay,
             LastCheckpointTime = _lastCheckpointTime,
             Phase = _phase,
-            PartitionsTotal = _ranges.Count,
-            PartitionsCompleted = _ranges.Count(r => r.Completed),
+            PartitionsTotal = rangeCount,
+            PartitionsCompleted = rangesDone,
+            PartitionSplits = splits,
             ActivePartitions = Volatile.Read(ref _activePartitions),
             IsPaused = IsPaused,
             LatestStep = _latestStep,
             Planner = _plannerProgress,
             InFlight = _inFlight.Snapshot(),
-            Partitions = SnapshotPartitions()
+            Partitions = partitionRows
         };
         _totals.CopyTo(stats);
         FillRequestDiagnostics(stats);
@@ -1509,7 +1746,7 @@ public class BucketComparisonEngine
     /// </summary>
     private sealed class CommitBatch
     {
-        public int RangeIndex { get; init; }
+        public required ScanPartition Range { get; init; }
         public List<ObjectDifference>? Differences { get; init; }
         public ScanCounters Delta { get; init; } = new();
         public string? LastCompletedKey { get; init; }
@@ -1525,7 +1762,7 @@ public class BucketComparisonEngine
     /// <summary>A worker's private state for one range.</summary>
     private sealed class RangeWork
     {
-        private readonly int _rangeIndex;
+        private readonly ScanPartition _range;
         private readonly ScanCounters _batchCounters = new();
         private List<ObjectDifference> _batchDiffs = new();
         private int _keysSinceCommit;
@@ -1539,9 +1776,9 @@ public class BucketComparisonEngine
         public string CurrentKeyA { get; set; } = "-";
         public string CurrentKeyB { get; set; } = "-";
 
-        public RangeWork(int rangeIndex, string? lastCompletedKey)
+        public RangeWork(ScanPartition range, string? lastCompletedKey)
         {
-            _rangeIndex = rangeIndex;
+            _range = range;
             LastCompletedKey = lastCompletedKey;
         }
 
@@ -1568,7 +1805,7 @@ public class BucketComparisonEngine
 
         public CommitBatch BuildBatch(bool completed) => new()
         {
-            RangeIndex = _rangeIndex,
+            Range = _range,
             Differences = _batchDiffs.Count > 0 ? _batchDiffs : null,
             Delta = _batchCounters.Clone(),
             LastCompletedKey = LastCompletedKey,
