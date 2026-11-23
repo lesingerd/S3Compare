@@ -92,6 +92,9 @@ public sealed class AmazonS3Lister : IS3Lister
             }
             catch (Exception ex) when (IsRetryable(ex) && attempt < _maxAttempts)
             {
+                tracked?.NoteFailedAttempt(ex is OperationCanceledException
+                    ? $"timed out after {_attemptTimeout.TotalSeconds:N0} s"
+                    : $"{ex.GetType().Name}: {ex.Message}");
                 await Task.Delay(_retryDelay * attempt, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException ex)

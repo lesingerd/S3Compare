@@ -27,6 +27,9 @@ public sealed class PlannerOptions
 
     /// <summary>Diagnostic log lines (called from several threads).</summary>
     public Action<string>? Log { get; init; }
+
+    /// <summary>Classified issues (a skipped request, a disabled technique, a time limit); called from several threads.</summary>
+    public Action<IssueOutcome, string>? OnIssue { get; init; }
 }
 
 /// <summary>
@@ -143,7 +146,7 @@ public static class PartitionPlanner
             var ranges = BuildRanges(candidates.Where(context.IsUsable), Math.Max(1, targetPartitions));
             ranges[0].LastCompletedKey = after;
             context.SetStep("Building ranges");
-            context.Finish(ranges.Count);
+            context.Finish(ranges.Count, targetPartitions);
             return ranges;
         }
         finally
@@ -511,6 +514,7 @@ public static class PartitionPlanner
         {
             if (!_disabled.TryAdd(bucket.Label + ": delimiter listing", 0)) return;
             Log($"Planner: bucket {bucket.Label} delimiter listing failed; disabled for the rest of this plan, continuing with probes. Last error: {LastError}");
+            Issue(IssueOutcome.Skipped, $"delimiter listing disabled for bucket {bucket.Label} after a failed request — planning continued with probes; results unaffected, only split quality may be lower");
             RaiseProgress(force: true);
         }
 
@@ -520,11 +524,17 @@ public static class PartitionPlanner
             if (streak >= MaxConsecutiveProbeFailures && _disabled.TryAdd(bucket.Label + ": key probing", 0))
             {
                 Log($"Planner: bucket {bucket.Label} probes failed {streak} times in a row; probing disabled for the rest of this plan. Last error: {LastError}");
+                Issue(IssueOutcome.Skipped, $"key probing disabled for bucket {bucket.Label} after {streak} failed probes in a row — planning continued; results unaffected, only split quality may be lower");
                 RaiseProgress(force: true);
             }
         }
 
         public void ProbeSucceeded(PlannerBucket bucket) => _probeFailureStreak[bucket.Label] = 0;
+
+        private void Issue(IssueOutcome outcome, string detail)
+        {
+            try { _options.OnIssue?.Invoke(outcome, detail); } catch { /* reporting must not affect planning */ }
+        }
 
         private string? LastError
         {
@@ -534,8 +544,10 @@ public static class PartitionPlanner
         private void RecordFailure(PlannerBucket bucket, string kind, string message)
         {
             int count = Interlocked.Increment(ref _failed);
-            string text = $"[{DateTime.Now:HH:mm:ss}] {bucket.Label} {kind}: {message}";
+            string detail = $"planner request {bucket.Label} {kind}: {message} — planning continued; results unaffected, only split quality may be lower";
+            string text = IssueEntry.Format(DateTime.Now, IssueOutcome.Skipped, detail);
             lock (_errorLock) _lastError = text;
+            Issue(IssueOutcome.Skipped, detail);
             // Every failure of the first few, then occasional ones, so a flood of failures cannot flood the log
             if (count <= 10 || count % 25 == 0) Log($"Planner request failed ({count:N0} so far): {text}");
             RaiseProgress(force: true);
@@ -617,6 +629,7 @@ public static class PartitionPlanner
                 _timedOut = true;
                 Log($"Planner: time limit of {_options.MaxDuration.TotalSeconds:N0} s reached after {_requestsSent:N0} requests and {_candidates.Count:N0} candidates; " +
                     "stopping planner requests and building ranges from what was found.");
+                Issue(IssueOutcome.Degraded, $"planning time limit of {_options.MaxDuration.TotalSeconds:N0} s reached after {_requestsSent:N0} requests and {_candidates.Count:N0} candidates — ranges built from what was found; results unaffected, the scan may use fewer parallel ranges (speed, not correctness)");
                 try { _timeBox.Cancel(); } catch (ObjectDisposedException) { }
                 RaiseProgress(force: true);
                 return;
@@ -626,11 +639,15 @@ public static class PartitionPlanner
 
         private TimeSpan ActiveElapsed => _clock.Elapsed - _paused;
 
-        public void Finish(int rangeCount)
+        public void Finish(int rangeCount, int targetPartitions)
         {
             _finished = true;
             RaiseProgress(force: true);
             var p = Snapshot();
+            if (!p.TimedOut && p.FailedRequests > 0 && targetPartitions > 1 && rangeCount < targetPartitions)
+            {
+                Issue(IssueOutcome.Degraded, $"planning built {rangeCount:N0} range(s) instead of {targetPartitions:N0} because {p.FailedRequests:N0} request(s) failed — results unaffected, the scan may be slower (speed, not correctness)");
+            }
             Log($"Planning finished: {rangeCount:N0} range(s) from {p.Candidates:N0} candidates, {p.RequestsUsed:N0}/{p.RequestBudget:N0} requests, " +
                 $"{p.FailedRequests:N0} failed, {p.Elapsed.TotalSeconds:N1} s{(p.TimedOut ? ", TIME LIMIT REACHED" : "")}" +
                 $"{(p.DisabledTechniques.Length > 0 ? ", disabled: " + p.DisabledTechniques : "")}");

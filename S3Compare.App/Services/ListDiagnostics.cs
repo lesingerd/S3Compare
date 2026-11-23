@@ -43,6 +43,17 @@ public sealed class InFlightOperations
         public long StartedTick { get; }
         public int Attempt { get => Volatile.Read(ref _attempt); set => Volatile.Write(ref _attempt, value); }
 
+        private string? _lastAttemptError;
+        /// <summary>Why the previous attempt failed (set when a retry starts).</summary>
+        public string? LastAttemptError => Volatile.Read(ref _lastAttemptError);
+
+        /// <summary>Called by a lister when an attempt failed and it is about to try again.</summary>
+        public void NoteFailedAttempt(string error)
+        {
+            Volatile.Write(ref _lastAttemptError, error);
+            Attempt++;
+        }
+
         /// <summary>Makes this the operation reported by <see cref="InFlightOperations.Current"/> in the calling async flow.</summary>
         public void MakeCurrent() => CurrentHandle.Value = this;
 
@@ -64,6 +75,8 @@ public sealed class ListMetrics
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private long _requests;
     private long _failures;
+    private long _retried;
+    private long _recovered;
     private double _totalLatencyMs;
     private double _lastLatencyMs;
     private string? _lastError;
@@ -72,10 +85,11 @@ public sealed class ListMetrics
     private long _windowCount;
     private double _recentRate;
 
-    public void RecordSuccess(double latencyMs)
+    public void RecordSuccess(double latencyMs, int attempts = 1)
     {
         lock (_lock)
         {
+            if (attempts > 1) { _retried++; _recovered++; }
             _requests++;
             _windowCount++;
             _totalLatencyMs += latencyMs;
@@ -83,10 +97,11 @@ public sealed class ListMetrics
         }
     }
 
-    public void RecordFailure(double latencyMs, string error)
+    public void RecordFailure(double latencyMs, string error, int attempts = 1)
     {
         lock (_lock)
         {
+            if (attempts > 1) _retried++;
             _requests++;
             _windowCount++;
             _failures++;
@@ -112,6 +127,8 @@ public sealed class ListMetrics
             {
                 Requests = _requests,
                 Failures = _failures,
+                Retried = _retried,
+                Recovered = _recovered,
                 AverageLatencyMs = ok > 0 ? _totalLatencyMs / ok : 0,
                 LastLatencyMs = _lastLatencyMs,
                 RequestsPerSecond = _recentRate > 0 ? _recentRate : (now > 0 ? _requests / now : 0),
@@ -156,9 +173,11 @@ public sealed class MeteredLister : IS3Lister
     private readonly string _label;
     private readonly ListMetrics _metrics;
     private readonly InFlightOperations _inFlight;
+    private readonly IssueLog? _issues;
 
-    public MeteredLister(IS3Lister inner, string label, ListMetrics metrics, InFlightOperations inFlight)
+    public MeteredLister(IS3Lister inner, string label, ListMetrics metrics, InFlightOperations inFlight, IssueLog? issues = null)
     {
+        _issues = issues;
         _inner = inner;
         _label = label;
         _metrics = metrics;
@@ -179,7 +198,13 @@ public sealed class MeteredLister : IS3Lister
             var page = await AbandonableTask.WithCancellation(
                 _inner.ListPageAsync(bucketName, prefix, startAfter, continuationToken, delimiter, maxKeys, cancellationToken),
                 cancellationToken).ConfigureAwait(false);
-            _metrics.RecordSuccess(Stopwatch.GetElapsedTime(start).TotalMilliseconds);
+            int attempts = op.Attempt;
+            _metrics.RecordSuccess(Stopwatch.GetElapsedTime(start).TotalMilliseconds, attempts);
+            if (attempts > 1)
+            {
+                _issues?.Add(IssueOutcome.Recovered,
+                    $"LIST {_label} bucket '{bucketName}' prefix='{Clip(prefix)}': recovered on attempt {attempts} — no impact (attempt {attempts - 1}: {op.LastAttemptError ?? "failed"})");
+            }
             return page;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -188,7 +213,7 @@ public sealed class MeteredLister : IS3Lister
         }
         catch (Exception ex)
         {
-            _metrics.RecordFailure(Stopwatch.GetElapsedTime(start).TotalMilliseconds, $"{ex.GetType().Name}: {ex.Message}");
+            _metrics.RecordFailure(Stopwatch.GetElapsedTime(start).TotalMilliseconds, $"{ex.GetType().Name}: {ex.Message}", op.Attempt);
             throw;
         }
     }

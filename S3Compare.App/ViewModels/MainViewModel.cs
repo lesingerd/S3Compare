@@ -511,7 +511,41 @@ public class MainViewModel : INotifyPropertyChanged
     public string StatusMessage
     {
         get => _statusMessage;
-        set => SetField(ref _statusMessage, value);
+        set
+        {
+            if (SetField(ref _statusMessage, value)) OnPropertyChanged(nameof(StatusBrush));
+        }
+    }
+
+    /// <summary>Blue normally; red only for a FAILED outcome.</summary>
+    public System.Windows.Media.Brush StatusBrush => _statusMessage.StartsWith("FAILED", StringComparison.Ordinal)
+        ? Converters.IssueBrushes.Failed : StatusBrushNormal;
+    private static readonly System.Windows.Media.Brush StatusBrushNormal = Converters.IssueBrushes.Frozen(0x38, 0xBD, 0xF8);
+
+    private IssueSummary _issues = IssueSummary.Empty;
+    /// <summary>Outcome-coloured issue summary (counts and the most severe recent issue) for the status bar.</summary>
+    public string IssueStatusText => _issues.Total == 0 ? string.Empty
+        : _issues.Line + (_issues.MostSevere != null ? " | " + _issues.MostSevere.Display : string.Empty);
+    public bool HasIssues => _issues.Total > 0;
+    public string IssueLineText => _issues.Line;
+    public string MostSevereText => "Most severe: " + (_issues.MostSevere != null ? _issues.MostSevere.Display : "none");
+    public System.Windows.Media.Brush IssueBrush => _issues.MostSevere != null ? Converters.IssueBrushes.For(_issues.MostSevere.Outcome) : Converters.IssueBrushes.None;
+    /// <summary>The newest issues, newest first.</summary>
+    public IReadOnlyList<IssueEntry> RecentIssues => _issues.Recent;
+
+    private void ApplyIssues(IssueSummary issues)
+    {
+        bool same = ReferenceEquals(issues, _issues)
+            || (issues.Total == _issues.Total && issues.MostSevere?.Id == _issues.MostSevere?.Id
+                && issues.Recent.FirstOrDefault()?.Id == _issues.Recent.FirstOrDefault()?.Id);
+        if (same) return;
+        _issues = issues;
+        OnPropertyChanged(nameof(IssueStatusText));
+        OnPropertyChanged(nameof(HasIssues));
+        OnPropertyChanged(nameof(IssueLineText));
+        OnPropertyChanged(nameof(MostSevereText));
+        OnPropertyChanged(nameof(IssueBrush));
+        OnPropertyChanged(nameof(RecentIssues));
     }
 
     public string StatusA
@@ -952,11 +986,12 @@ public class MainViewModel : INotifyPropertyChanged
     {
         Statistics = stats;
         PhaseText = DiagnosticsFormatter.DisplayPhase(stats).ToUpperInvariant();
+        ApplyIssues(stats.Issues);
         if (!IsStopping) StatusMessage = BuildStatusMessage(stats);
 
         if (IsDiagnosticsExpanded)
         {
-            DiagnosticsText = DiagnosticsFormatter.Format(stats);
+            DiagnosticsText = DiagnosticsFormatter.Format(stats, includeIssues: false);
             if (PartitionRows.Count != stats.Partitions.Count)
             {
                 PartitionRows.Clear();
@@ -979,6 +1014,7 @@ public class MainViewModel : INotifyPropertyChanged
         PhaseText = "IDLE";
         DiagnosticsText = "No scan has been started.";
         PartitionRows.Clear();
+        ApplyIssues(IssueSummary.Empty);
         StatusA = "Idle";
         StatusB = "Idle";
         CurrentKeyA = "-";
@@ -1158,7 +1194,7 @@ public class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception ex)
         {
-            StatusMessage = $"Error during comparison: {ex.Message}";
+            StatusMessage = $"FAILED: the comparison was stopped by an error \u2014 {ex.Message}";
             StatusA = "Error";
             StatusB = "Error";
             MessageBox.Show($"Comparison stopped due to error:\n\n{ex.Message}\n\nA checkpoint has been preserved if you wish to resume after addressing the issue.", "Comparison Error", MessageBoxButton.OK, MessageBoxImage.Error);
